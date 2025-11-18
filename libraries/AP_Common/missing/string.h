@@ -1,3 +1,5 @@
+#pragma once
+
 #include_next <string.h>
 
 // Necessary for toolchains that does not provide `strndupa`, such as musl.
