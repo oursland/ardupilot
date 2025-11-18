@@ -1,3 +1,5 @@
+#pragma once
+
 #if defined(HAVE_ENDIAN_H) && HAVE_ENDIAN_H
 #include_next <endian.h>
 #else

@@ -1,3 +1,5 @@
+#pragma once
+
 #if defined(HAVE_BYTESWAP_H) && HAVE_BYTESWAP_H
 #include_next <byteswap.h>
 #else
