@@ -312,10 +312,27 @@ void AP_Vehicle::setup()
     // load the default values of variables listed in var_info[]
     AP_Param::setup_sketch_defaults();
 
+#if AP_SCHEDULER_ENABLED
+    // initialise the main loop scheduler
+    const AP_Scheduler::Task *tasks;
+    uint8_t task_count;
+    uint32_t log_bit;
+    get_scheduler_tasks(tasks, task_count, log_bit);
+    AP::scheduler().init(tasks, task_count, log_bit);
+
+    // time per loop - this gets updated in the main loop() based on
+    // actual loop rate
+    G_Dt = scheduler.get_loop_period_s();
+#endif
+
 #if AP_SERIALMANAGER_ENABLED
     // initialise serial port
-    serial_manager.init_console();
+    serial_manager.init();
+
+    // serial_manager.init_console();
 #endif
+
+    hal.scheduler->delay(1000);
 
     DEV_PRINTF("\n\nInit %s"
                         "\n\nFree RAM: %u\n",
@@ -337,19 +354,6 @@ void AP_Vehicle::setup()
         sdcard_stop();
         sdcard_retry();
     }
-#endif
-
-#if AP_SCHEDULER_ENABLED
-    // initialise the main loop scheduler
-    const AP_Scheduler::Task *tasks;
-    uint8_t task_count;
-    uint32_t log_bit;
-    get_scheduler_tasks(tasks, task_count, log_bit);
-    AP::scheduler().init(tasks, task_count, log_bit);
-
-    // time per loop - this gets updated in the main loop() based on
-    // actual loop rate
-    G_Dt = scheduler.get_loop_period_s();
 #endif
 
     // this is here for Plane; its failsafe_check method requires the

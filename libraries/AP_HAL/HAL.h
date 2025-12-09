@@ -57,12 +57,12 @@ public:
         AP_HAL::CANIface** _can_ifaces)
 #endif
         :
+        console(_console),
         i2c_mgr(_i2c_mgr),
         spi(_spi),
         wspi(_wspi),
         analogin(_analogin),
         storage(_storage),
-        console(_console),
         gpio(_gpio),
         rcin(_rcin),
         rcout(_rcout),
@@ -120,12 +120,12 @@ public:
     virtual void run(int argc, char * const argv[], Callbacks* callbacks) const = 0;
 
 public:
+    AP_HAL::UARTDriver* console;
     AP_HAL::I2CDeviceManager* i2c_mgr;
     AP_HAL::SPIDeviceManager* spi;
     AP_HAL::WSPIDeviceManager* wspi;
     AP_HAL::AnalogIn*   analogin;
     AP_HAL::Storage*    storage;
-    AP_HAL::UARTDriver* console;
     AP_HAL::GPIO*       gpio;
     AP_HAL::RCInput*    rcin;
     AP_HAL::RCOutput*   rcout;
