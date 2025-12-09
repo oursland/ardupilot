@@ -34,6 +34,7 @@
 #include <AP_BoardConfig/AP_BoardConfig.h>
 #include <AP_Compass/AP_Compass.h>
 #include <AP_ExternalAHRS/AP_ExternalAHRS.h>
+#include <AP_Filesystem/AP_Filesystem.h>
 #include <AP_GPS/AP_GPS_FixType.h>
 #include <AP_GPS/AP_GPS.h>
 #include <AP_HAL/utility/sparse-endian.h>
@@ -49,6 +50,8 @@
 #include "serialPortPlatform.h"
 
 extern const AP_HAL::HAL &hal;
+
+AP_ExternalAHRS_InertialSense *AP_ExternalAHRS_InertialSense::instance = nullptr;
 
 AP_ExternalAHRS_InertialSense::AP_ExternalAHRS_InertialSense(AP_ExternalAHRS *_frontend, AP_ExternalAHRS::state_t &_state)
     : AP_ExternalAHRS_backend(_frontend, _state)
@@ -75,9 +78,9 @@ AP_ExternalAHRS_InertialSense::AP_ExternalAHRS_InertialSense(AP_ExternalAHRS *_f
     }
 
     // don't offer IMU by default, the processing can take the main loop below minimum rate
-    set_default_sensors(uint16_t(AP_ExternalAHRS::AvailableSensor::GPS)); // |
+    set_default_sensors(uint16_t(AP_ExternalAHRS::AvailableSensor::GPS) |
                         // uint16_t(AP_ExternalAHRS::AvailableSensor::BARO) |
-                        // uint16_t(AP_ExternalAHRS::AvailableSensor::COMPASS));
+                        uint16_t(AP_ExternalAHRS::AvailableSensor::COMPASS));
 
     hal.scheduler->delay(1000);
 }
@@ -216,6 +219,16 @@ int AP_ExternalAHRS_InertialSense::enable_message_broadcasting(port_handle_t por
         return -5;
     }
 
+    char *dir_path = "./isb_ppd";
+    int ret = AP::FS().mkdir(dir_path);
+    if (ret == -1) {
+        if (errno == EEXIST) {
+            printf("Directory - %s already exist\n", dir_path);
+        } else {
+            printf("Failed to create directory %s - %s\n", dir_path, strerror(errno));
+        }
+    }
+
     // Don't offer IMU by default, as it may drop the main loop below minimum rate
     // // Ask for IMU message at period of 20ms (1ms source period x 20).
     // if (is_comm_get_data(port, DID_PIMU, 0, 0, imu_sample_duration) < 0)
@@ -224,11 +237,11 @@ int AP_ExternalAHRS_InertialSense::enable_message_broadcasting(port_handle_t por
     //     return -6;
     // }
 
-    // if (is_comm_get_data(port, DID_MAGNETOMETER, 0, 0, 1) < 0)
-    // {
-    //     printf("Failed to encode and write get MAG message\r\n");
-    //     return -6;
-    // }
+    if (is_comm_get_data(port, DID_MAGNETOMETER, 0, 0, 1) < 0)
+    {
+        printf("Failed to encode and write get MAG message\r\n");
+        return -6;
+    }
 
     // if (is_comm_get_data(port, DID_BAROMETER, 0, 0, 1) < 0)
     // {
@@ -258,6 +271,15 @@ int AP_ExternalAHRS_InertialSense::initialize()
 
     is_comm_init(&comm, comm_buf, sizeof(comm_buf), NULL);
     is_comm_enable_protocol(&comm, _PTYPE_INERTIAL_SENSE_DATA);
+
+    instance = this;
+    is_comm_register_isb_handler(&comm, &AP_ExternalAHRS_InertialSense::isbDataHandler);
+
+    char *file_path = "./isb_ppd/ppd.log";
+    ppd_fd = AP::FS().open(file_path, O_WRONLY | O_CREAT | O_TRUNC);
+    if (ppd_fd == -1) {
+        printf("Open %s failed - %s\n", file_path, strerror(errno));
+    }
 
     serialPortPlatformInit(&serialPort);
 
@@ -594,6 +616,40 @@ void AP_ExternalAHRS_InertialSense::update() {
     }
 }
 
+int AP_ExternalAHRS_InertialSense::parseIsbData(void* ctx, p_data_t* data, port_handle_t port) {
+    switch (data->hdr.id)
+    {
+    case DID_INS_3:
+        handleIns3Message((ins_3_t*)data->ptr);
+        break;
+
+    case DID_GPS1_POS:
+        handleGpsPosMessage((gps_pos_t*)data->ptr);
+        break;
+
+    case DID_GPS1_VEL:
+        handleGpsVelMessage((gps_vel_t*)data->ptr);
+        break;
+
+    case DID_DEV_INFO:
+        handleDevInfoMessage((dev_info_t*)data->ptr);
+        break;
+
+    case DID_BIT:
+        handleBitMessage((bit_t*)data->ptr);
+        break;
+
+    case DID_MAGNETOMETER:
+        handleMagnetometerMessage((magnetometer_t *)data->ptr);
+        break;
+
+    default:
+        break;
+    }
+
+    return 0;
+}
+
 bool AP_ExternalAHRS_InertialSense::check_uart() {
     if(!initialized) {
         printf("UART not initialized!\n");
@@ -605,71 +661,10 @@ bool AP_ExternalAHRS_InertialSense::check_uart() {
     if(!uart->available())
         return false;
 
-    uint8_t val;
-    if(!uart->read(val))
-        return false;
-
-    switch (is_comm_parse_byte(&comm, val))
-    {
-    case _PTYPE_NONE:
-        break;
-
-    case _PTYPE_INERTIAL_SENSE_DATA:
-        switch (comm.rxPkt.hdr.id)
-        {
-        // case DID_INS_1:
-        //     handleIns1Message((ins_1_t*)comm.rxPkt.data.ptr);
-        //     break;
-
-        // case DID_INS_2:
-        //     handleIns2Message((ins_2_t*)comm.rxPkt.data.ptr);
-        //     break;
-
-        case DID_INS_3:
-            handleIns3Message((ins_3_t*)comm.rxPkt.data.ptr);
-            break;
-
-        case DID_GPS1_POS:
-            handleGpsPosMessage((gps_pos_t*)comm.rxPkt.data.ptr);
-            break;
-
-        case DID_GPS1_VEL:
-            handleGpsVelMessage((gps_vel_t*)comm.rxPkt.data.ptr);
-            break;
-
-        // case DID_GPS1_RTK_POS_MISC:
-        //     handleGpsRtkPosMiscMessage((gps_rtk_misc_t*)comm.rxPkt.data.ptr);
-        //     break;
-
-        // case DID_PIMU:
-        //     handlePimuMessage((pimu_t*)comm.rxPkt.data.ptr);
-        //     break;
-
-        // case DID_BAROMETER:
-        //     handleBarometerMessage((barometer_t*)comm.rxPkt.data.ptr);
-        //     break;
-
-        // case DID_MAGNETOMETER:
-        //     handleMagnetometerMessage((magnetometer_t *)comm.rxPkt.data.ptr);
-        //     break;
-
-        case DID_DEV_INFO:
-            handleDevInfoMessage((dev_info_t*)comm.rxPkt.data.ptr);
-            break;
-
-        case DID_BIT:
-            handleBitMessage((bit_t*)comm.rxPkt.data.ptr);
-            break;
-
-        default:
-            printf("unhandled pkt: %d\r\n", comm.rxPkt.hdr.id);
-            break;
-        }
-        break;
-
-    default:
-        break;
-    }
+    auto len = uart->read(buffer, MIN(uart->available(), 1024));
+    is_comm_buffer_parse_messages(buffer, len, &comm);
+    AP::FS().write(ppd_fd, buffer, len);
+    AP::FS().fsync(ppd_fd);
 
     return true;
 }
