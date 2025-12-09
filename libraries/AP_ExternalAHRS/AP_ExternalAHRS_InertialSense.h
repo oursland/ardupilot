@@ -72,6 +72,14 @@ private:
     void handleBarometerMessage(barometer_t* bar);
     void handleDevInfoMessage(dev_info_t *dev_info);
     void handleBitMessage(bit_t* bit);
+    int parseIsbData(void* ctx, p_data_t* data, port_handle_t port);
+
+    // callback helper
+    static AP_ExternalAHRS_InertialSense *instance;
+    static int isbDataHandler(void* ctx, p_data_t* data, port_handle_t port) {
+        return instance->parseIsbData(ctx, data, port);
+    }
+    int ppd_fd;
 
     bool initialized = false;
     bool _healthy = false;

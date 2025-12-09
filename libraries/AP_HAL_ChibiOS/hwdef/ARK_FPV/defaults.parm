@@ -7,10 +7,10 @@ GPS1_TYPE 21
 GPS_AUTO_CONFIG 0
 
 ## Motor mapping
-SERVO1_FUNCTION 34  	# Motor 2 -- this should match your motor layout
-SERVO2_FUNCTION 35  	# Motor 3
-SERVO3_FUNCTION 36  	# Motor 4
-SERVO4_FUNCTION 33  	# Motor 1
+SERVO1_FUNCTION 36  	# Motor 4 -- this should match your motor layout
+SERVO2_FUNCTION 33  	# Motor 1
+SERVO3_FUNCTION 34  	# Motor 2
+SERVO4_FUNCTION 35  	# Motor 3
 
 ## Dshot ESC setup
 MOT_PWM_TYPE 6 		# DShot600
@@ -22,3 +22,5 @@ SERVO_BLH_BDMASK 15 	# Channels 1 - 4
 ## ESC Passthrough
 SERVO_BLH_AUTO 1
 SERVO_BLH_MASK 15 # (if using output channels 1 - 4)
+
+SERVO_BLH_OTYPE 6
