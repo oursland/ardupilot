@@ -16,8 +16,9 @@
  */
 
 
-#include "AP_ExternalAHRS/ISComm.h"
+#include <algorithm>
 #include <cstdint>
+
 #ifdef AP_MATH_ALLOW_DOUBLE_FUNCTIONS
 #undef AP_MATH_ALLOW_DOUBLE_FUNCTIONS
 #endif
@@ -46,6 +47,7 @@
 
 #include "base_port.h"
 #include "data_sets.h"
+#include "ISComm.h"
 #include "serialPort.h"
 #include "serialPortPlatform.h"
 
@@ -79,7 +81,7 @@ AP_ExternalAHRS_InertialSense::AP_ExternalAHRS_InertialSense(AP_ExternalAHRS *_f
 
     // don't offer IMU by default, the processing can take the main loop below minimum rate
     set_default_sensors(uint16_t(AP_ExternalAHRS::AvailableSensor::GPS) |
-                        // uint16_t(AP_ExternalAHRS::AvailableSensor::BARO) |
+                        uint16_t(AP_ExternalAHRS::AvailableSensor::BARO) |
                         uint16_t(AP_ExternalAHRS::AvailableSensor::COMPASS));
 
     hal.scheduler->delay(1000);
@@ -149,9 +151,9 @@ void AP_ExternalAHRS_InertialSense::get_filter_status(nav_filter_status &status)
 }
 
 bool AP_ExternalAHRS_InertialSense::get_variances(float &velVar, float &posVar, float &hgtVar, Vector3f &magVar, float &tasVar) const {
-    velVar = vel_cov * vel_cov * vel_gate_scale;
-    posVar = pos_cov * pos_cov * pos_gate_scale;
-    hgtVar = hgt_cov * hgtVar * hgt_gate_scale;
+    velVar = vel_cov * vel_gate_scale;
+    posVar = pos_cov * pos_gate_scale;
+    hgtVar = hgt_cov * hgt_gate_scale;
     tasVar = 0;
     return true;
 }
@@ -210,6 +212,40 @@ int AP_ExternalAHRS_InertialSense::enable_message_broadcasting(port_handle_t por
         return -5;
     }
 
+    // Don't offer IMU by default, as it may drop the main loop below minimum rate
+    // // Ask for IMU message at period of 20ms (1ms source period x 20).
+    // if (is_comm_get_data(port, DID_PIMU, 0, 0, imu_sample_duration) < 0)
+    // {
+    //     printf("Failed to encode and write get PIMU message\r\n");
+    //     return -6;
+    // }
+
+    if (is_comm_get_data(port, DID_MAGNETOMETER, 0, 0, 1) < 0)
+    {
+        printf("Failed to encode and write get MAG message\r\n");
+        return -6;
+    }
+
+    if (is_comm_get_data(port, DID_BAROMETER, 0, 0, 1) < 0)
+    {
+        printf("Failed to encode and write get BARO message\r\n");
+        return -6;
+    }
+
+    if (is_comm_get_data(port, DID_INL2_NED_SIGMA, 0, 0, 1) < 0)
+    {
+        printf("Failed to encode and write get NL2_NED_SIGMA message\r\n");
+        return -6;
+    }
+
+    // request a device info message
+    if (is_comm_get_data(port, DID_DEV_INFO, 0, 0, 0) < 0)
+    {
+        printf("Failed to encode and write get BARO message\r\n");
+        return -6;
+    }
+
+#ifdef LOG_PPD
     // Enable PPD data stream without disabling other messages
     rmc_t rmc;
     rmc.bits = RMC_PRESET_IMX_PPD;
@@ -228,33 +264,7 @@ int AP_ExternalAHRS_InertialSense::enable_message_broadcasting(port_handle_t por
             printf("Failed to create directory %s - %s\n", dir_path, strerror(errno));
         }
     }
-
-    // Don't offer IMU by default, as it may drop the main loop below minimum rate
-    // // Ask for IMU message at period of 20ms (1ms source period x 20).
-    // if (is_comm_get_data(port, DID_PIMU, 0, 0, imu_sample_duration) < 0)
-    // {
-    //     printf("Failed to encode and write get PIMU message\r\n");
-    //     return -6;
-    // }
-
-    if (is_comm_get_data(port, DID_MAGNETOMETER, 0, 0, 1) < 0)
-    {
-        printf("Failed to encode and write get MAG message\r\n");
-        return -6;
-    }
-
-    // if (is_comm_get_data(port, DID_BAROMETER, 0, 0, 1) < 0)
-    // {
-    //     printf("Failed to encode and write get BARO message\r\n");
-    //     return -6;
-    // }
-
-    // request a device info message
-    if (is_comm_get_data(port, DID_DEV_INFO, 0, 0, 0) < 0)
-    {
-        printf("Failed to encode and write get BARO message\r\n");
-        return -6;
-    }
+#endif
 
     return 0;
 }
@@ -275,11 +285,13 @@ int AP_ExternalAHRS_InertialSense::initialize()
     instance = this;
     is_comm_register_isb_handler(&comm, &AP_ExternalAHRS_InertialSense::isbDataHandler);
 
+#ifdef LOG_PPD
     char *file_path = "./isb_ppd/ppd.log";
     ppd_fd = AP::FS().open(file_path, O_WRONLY | O_CREAT | O_TRUNC);
     if (ppd_fd == -1) {
         printf("Open %s failed - %s\n", file_path, strerror(errno));
     }
+#endif
 
     serialPortPlatformInit(&serialPort);
 
@@ -313,9 +325,6 @@ void AP_ExternalAHRS_InertialSense::handleIns1Message(ins_1_t* ins)
     last_filter_pkt = AP_HAL::millis();
 
     WITH_SEMAPHORE(state.sem);
-
-    // TODO: check ins->insStatus;
-    // TODO: check ins->hdwStatus;
 
     Quaternion q;
     q.from_euler(ins->theta[0], ins->theta[1], ins->theta[2]);    
@@ -468,9 +477,6 @@ void AP_ExternalAHRS_InertialSense::handleGpsPosMessage(gps_pos_t* pos)
     gps_data_msg.msl_altitude = msl_altitude;
 
     gps_data_msg.hdop = pos->hAcc * 100;
-
-    pos_cov = pos->hAcc;
-    hgt_cov = pos->hMSL;
 }
 
 void AP_ExternalAHRS_InertialSense::handleGpsVelMessage(gps_vel_t* vel)
@@ -496,8 +502,6 @@ void AP_ExternalAHRS_InertialSense::handleGpsVelMessage(gps_vel_t* vel)
     }
 
     gps_data_msg.vdop = vel->sAcc * 100;
-
-    vel_cov = vel->sAcc;
 }
 
 void AP_ExternalAHRS_InertialSense::handleGpsRtkPosMiscMessage(gps_rtk_misc_t* misc)
@@ -539,7 +543,11 @@ void AP_ExternalAHRS_InertialSense::handleMagnetometerMessage(magnetometer_t* _m
 #if AP_COMPASS_EXTERNALAHRS_ENABLED
     AP_ExternalAHRS::mag_data_message_t mag;
     mag.field = Vector3f{_mag->mag[0], _mag->mag[1], _mag->mag[2]};
-    mag.field *= 1000; // to mGauss
+
+    // mag values have been normalized to 1, so we scale to something that can be calibrated
+
+    // For SN510457, multiply DID_MAGNETOMETER by 0.4381111936 to scale back to the sensor raw output.
+    mag.field *= 0.4381111936 * 0.4 * 1000;
 
     AP::compass().handle_external(mag);
 #endif
@@ -555,6 +563,16 @@ void AP_ExternalAHRS_InertialSense::handleBarometerMessage(barometer_t* bar)
 
     AP::baro().handle_external(baro);
 #endif
+}
+
+void AP_ExternalAHRS_InertialSense::handleInl2NedSigmaMessage(inl2_ned_sigma_t *sigmas)
+{
+    float pos_std = Vector3f(sigmas->StdPosNed[0], sigmas->StdPosNed[1], sigmas->StdPosNed[2]).length();
+    float vel_std = Vector3f(sigmas->StdVelNed[0], sigmas->StdVelNed[1], sigmas->StdVelNed[2]).length();
+
+    pos_cov = pos_std * pos_std;
+    vel_cov = vel_std * vel_std;
+    hgt_cov = pos_std * pos_std;
 }
 
 void AP_ExternalAHRS_InertialSense::handleDevInfoMessage(dev_info_t *dev_info)
@@ -631,16 +649,20 @@ int AP_ExternalAHRS_InertialSense::parseIsbData(void* ctx, p_data_t* data, port_
         handleGpsVelMessage((gps_vel_t*)data->ptr);
         break;
 
+    case DID_MAGNETOMETER:
+        handleMagnetometerMessage((magnetometer_t *)data->ptr);
+        break;
+
+    case DID_INL2_NED_SIGMA:
+        handleInl2NedSigmaMessage((inl2_ned_sigma_t *)data->ptr);
+        break;
+
     case DID_DEV_INFO:
         handleDevInfoMessage((dev_info_t*)data->ptr);
         break;
 
     case DID_BIT:
         handleBitMessage((bit_t*)data->ptr);
-        break;
-
-    case DID_MAGNETOMETER:
-        handleMagnetometerMessage((magnetometer_t *)data->ptr);
         break;
 
     default:
@@ -663,8 +685,11 @@ bool AP_ExternalAHRS_InertialSense::check_uart() {
 
     auto len = uart->read(buffer, MIN(uart->available(), 1024));
     is_comm_buffer_parse_messages(buffer, len, &comm);
+
+#ifdef LOG_PPD
     AP::FS().write(ppd_fd, buffer, len);
     AP::FS().fsync(ppd_fd);
+#endif
 
     return true;
 }

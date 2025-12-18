@@ -70,6 +70,7 @@ private:
     void handlePimuMessage(pimu_t* pimu);
     void handleMagnetometerMessage(magnetometer_t* mag);
     void handleBarometerMessage(barometer_t* bar);
+    void handleInl2NedSigmaMessage(inl2_ned_sigma_t *sigmas);
     void handleDevInfoMessage(dev_info_t *dev_info);
     void handleBitMessage(bit_t* bit);
     int parseIsbData(void* ctx, p_data_t* data, port_handle_t port);
