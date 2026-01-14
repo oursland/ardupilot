@@ -288,8 +288,8 @@ private:
     static void is_comm_buffer_parse_messages(uint8_t *buf, uint32_t buf_size, is_comm_instance_t* comm);
 
     void initialize();
-    void update_thread();
-    bool check_uart();
+    void start();
+    void read_fifo();
 
     int stop_message_broadcasting();
     int enable_message_broadcasting();
@@ -319,7 +319,7 @@ private:
 
     uint32_t baudrate;
     int8_t port_num;
-    uint8_t buffer[1024];
+    uint8_t buffer[128];
 
     uint32_t last_gps_pkt;
     uint32_t last_filter_pkt;
@@ -338,7 +338,7 @@ private:
     AP_ExternalAHRS::gps_data_message_t gps_data_msg;
     AP_ExternalAHRS::gps_data_message_t gps2_data_msg;
 
-    AP_HAL::UARTDriver *uart;
+    AP_HAL::OwnPtr<AP_HAL::Device> dev;
     HAL_Semaphore sem;
 };
 
