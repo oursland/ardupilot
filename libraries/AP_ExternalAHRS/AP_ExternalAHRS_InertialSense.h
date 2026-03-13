@@ -756,8 +756,8 @@ protected:
 
 private:
     int initialize();
-    void update_thread();
-    bool check_uart();
+    void start();
+    void read_fifo();
 
     int stop_message_broadcasting();
     int enable_message_broadcasting();
@@ -805,7 +805,7 @@ private:
 
     AP_ExternalAHRS::gps_data_message_t gps_data_msg;
 
-    AP_HAL::UARTDriver *uart;
+    AP_HAL::OwnPtr<AP_HAL::Device> dev;
     HAL_Semaphore sem;
 };
 

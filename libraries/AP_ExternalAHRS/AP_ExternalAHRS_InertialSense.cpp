@@ -568,36 +568,23 @@ AP_ExternalAHRS_InertialSense::AP_ExternalAHRS_InertialSense(AP_ExternalAHRS *_f
     printf("Inertial Sense ExternalAHRS created\r\n");
     hal.scheduler->delay(1000);
 
-    auto &sm = AP::serialmanager();
-    uart = sm.find_serial(AP_SerialManager::SerialProtocol_AHRS, 0);
+    dev = hal.spi->get_device("imx5");
 
-    baudrate = 921600; // sm.find_baudrate(AP_SerialManager::SerialProtocol_AHRS, 0);
-    port_num = sm.find_portnum(AP_SerialManager::SerialProtocol_AHRS, 0);
+    dev->set_speed(AP_HAL::Device::SPEED_LOW);
 
-    printf("Inertial Sense ExternalAHRS created: baudrate [%" PRIu32 "], port_num [%d]\n\n", baudrate, port_num);
+    port_num = dev->bus_num();
 
-    if (!uart) {
-        printf("Inertial Sense ExternalAHRS no UART\r\n");
-        GCS_SEND_TEXT(MAV_SEVERITY_ERROR, "Inertial Sense ExternalAHRS no UART");
-        return;
-    }
-
-    if (!hal.scheduler->thread_create(FUNCTOR_BIND_MEMBER(&AP_ExternalAHRS_InertialSense::update_thread, void), "AHRS", 4096, AP_HAL::Scheduler::PRIORITY_SPI, 0)) {
-        AP_BoardConfig::allocation_error("Inertial Sense failed to allocate ExternalAHRS update thread");
-    }
+    initialize();
 
     // don't offer IMU by default, the processing can take the main loop below minimum rate
     set_default_sensors(uint16_t(AP_ExternalAHRS::AvailableSensor::GPS) |
                         uint16_t(AP_ExternalAHRS::AvailableSensor::BARO) |
                         uint16_t(AP_ExternalAHRS::AvailableSensor::COMPASS));
 
-    hal.scheduler->delay(1000);
+    dev->register_periodic_callback(4 * AP_USEC_PER_MSEC, FUNCTOR_BIND_MEMBER(&AP_ExternalAHRS_InertialSense::read_fifo, void));
 }
 
 int8_t AP_ExternalAHRS_InertialSense::get_port(void) const {
-    if (!uart) {
-        return -1;
-    }
     return port_num;
 }
 
@@ -668,14 +655,14 @@ int AP_ExternalAHRS_InertialSense::stop_message_broadcasting()
     // Stop all broadcasts on the device
     // int ret = is_comm_stop_broadcasts_all_ports(port);
     int size = is_comm_write_to_buf(buffer, sizeof(buffer), &comm, PKT_TYPE_STOP_BROADCASTS_ALL_PORTS, 0, 0, 0, nullptr);
-    if(uart->write(buffer, (uint16_t)size) != (size_t)size) {
+    if(!dev->transfer(buffer, size, nullptr, 0)) {
         printf("Failed to encode and write stop broadcasts message\r\n");
         return -3;
     }
 
     // ret = is_comm_stop_broadcasts_current_port(port);
     size = is_comm_write_to_buf(buffer, sizeof(buffer), &comm, PKT_TYPE_STOP_BROADCASTS_CURRENT_PORT, 0, 0, 0, nullptr);
-    if(uart->write(buffer, (uint16_t)size) != (size_t)size) {
+    if(!dev->transfer(buffer, size, nullptr, 0)) {
         printf("Failed to encode and write stop broadcasts message\r\n");
         return -3;
     }
@@ -691,62 +678,60 @@ int AP_ExternalAHRS_InertialSense::enable_message_broadcasting()
 
     // Ask for INS message w/ update 8ms period (4ms source period x 2)
     size = is_comm_get_data_to_buf(buffer, sizeof(buffer), &comm, DID_INS_3, 0, 0, 1);
-    if(uart->write(buffer, (uint16_t)size) != (size_t)size) {
+    if(!dev->transfer(buffer, size, nullptr, 0)) {
         printf("Failed to encode and write get INS message\r\n");
         return -4;
     }
 
     // Ask for GPS message at period of 200ms (200ms source period x 1).  Offset and size can be left at 0 unless you want to just pull a specific field from a data set.
     size = is_comm_get_data_to_buf(buffer, sizeof(buffer), &comm, DID_GPS1_POS, 0, 0, 1);
-    if(uart->write(buffer, (uint16_t)size) != (size_t)size) {
+    if(!dev->transfer(buffer, size, nullptr, 0)) {
         printf("Failed to encode and write get GPS POS message\r\n");
         return -5;
     }
 
     // Ask for GPS message at period of 200ms (200ms source period x 1).  Offset and size can be left at 0 unless you want to just pull a specific field from a data set.
     size = is_comm_get_data_to_buf(buffer, sizeof(buffer), &comm, DID_GPS1_VEL, 0, 0, 1);
-    if(uart->write(buffer, (uint16_t)size) != (size_t)size) {
+    if(!dev->transfer(buffer, size, nullptr, 0)) {
         printf("Failed to encode and write get GPS VEL message\r\n");
         return -5;
     }
 
     // Ask for GPS message at period of 200ms (200ms source period x 1).  Offset and size can be left at 0 unless you want to just pull a specific field from a data set.
     size = is_comm_get_data_to_buf(buffer, sizeof(buffer), &comm, DID_GPS1_RTK_POS_MISC, 0, 0, 1);
-    if(uart->write(buffer, (uint16_t)size) != (size_t)size) {
+    if(!dev->transfer(buffer, size, nullptr, 0)) {
         printf("Failed to encode and write get RTK POS MISC message\r\n");
         return -5;
     }
 
-    // Don't offer IMU by default, as it may drop the main loop below minimum rate
-    // // Ask for IMU message at period of 20ms (1ms source period x 20).
-    // size = is_comm_get_data_to_buf(buffer, sizeof(buffer), &comm, DID_PIMU, 0, 0, imu_sample_duration);
-    // if(uart->write(buffer, (uint16_t)size) != (size_t)size) {
-    // {
-    //     printf("Failed to encode and write get PIMU message\r\n");
-    //     return -6;
-    // }
+    // Ask for IMU message at period of imu_sample_duration (4ms source period x (imu_sample_duration / 4)).
+    size = is_comm_get_data_to_buf(buffer, sizeof(buffer), &comm, DID_PIMU, 0, 0, imu_sample_duration / 4);
+    if(!dev->transfer(buffer, size, nullptr, 0)) {
+        printf("Failed to encode and write get PIMU message\r\n");
+        return -6;
+    }
 
     size = is_comm_get_data_to_buf(buffer, sizeof(buffer), &comm, DID_MAGNETOMETER, 0, 0, 1);
-    if(uart->write(buffer, (uint16_t)size) != (size_t)size) {
+    if(!dev->transfer(buffer, size, nullptr, 0)) {
         printf("Failed to encode and write get MAG message\r\n");
         return -6;
     }
 
     size = is_comm_get_data_to_buf(buffer, sizeof(buffer), &comm, DID_BAROMETER, 0, 0, 1);
-    if(uart->write(buffer, (uint16_t)size) != (size_t)size) {
+    if(!dev->transfer(buffer, size, nullptr, 0)) {
         printf("Failed to encode and write get BARO message\r\n");
         return -6;
     }
 
     size = is_comm_get_data_to_buf(buffer, sizeof(buffer), &comm, DID_INL2_NED_SIGMA, 0, 0, 1);
-    if(uart->write(buffer, (uint16_t)size) != (size_t)size) {
+    if(!dev->transfer(buffer, size, nullptr, 0)) {
         printf("Failed to encode and write get NL2_NED_SIGMA message\r\n");
         return -6;
     }
 
     // request a device info message
     size = is_comm_get_data_to_buf(buffer, sizeof(buffer), &comm, DID_DEV_INFO, 0, 0, 0);
-    if(uart->write(buffer, (uint16_t)size) != (size_t)size) {
+    if(!dev->transfer(buffer, size, nullptr, 0)) {
         printf("Failed to encode and write get BARO message\r\n");
         return -6;
     }
@@ -756,13 +741,9 @@ int AP_ExternalAHRS_InertialSense::enable_message_broadcasting()
 
 int AP_ExternalAHRS_InertialSense::initialize()
 {
+    WITH_SEMAPHORE(dev->get_semaphore());
+
     printf("Inertial Sense ExternalAHRS initialize\r\n");
-
-    if (uart == nullptr) {
-        return -1;
-    }
-
-    uart->begin(baudrate);
 
     is_comm_init(&comm, comm_buf, sizeof(comm_buf), nullptr);
     is_comm_enable_protocol(&comm, _PTYPE_INERTIAL_SENSE_DATA);
@@ -1073,9 +1054,6 @@ void AP_ExternalAHRS_InertialSense::handleBitMessage(bit_t* bit)
 }
 
 void AP_ExternalAHRS_InertialSense::update() {
-    if (!check_uart()) {
-        hal.scheduler->delay_microseconds(100);
-    }
 }
 
 int AP_ExternalAHRS_InertialSense::parseIsbData(void* ctx, p_data_t* data, port_handle_t port) {
@@ -1091,6 +1069,10 @@ int AP_ExternalAHRS_InertialSense::parseIsbData(void* ctx, p_data_t* data, port_
 
     case DID_GPS1_VEL:
         handleGpsVelMessage((gps_vel_t*)data->ptr);
+        break;
+
+    case DID_PIMU:
+        handlePimuMessage((pimu_t *)data->ptr);
         break;
 
     case DID_MAGNETOMETER:
@@ -1116,33 +1098,12 @@ int AP_ExternalAHRS_InertialSense::parseIsbData(void* ctx, p_data_t* data, port_
     return 0;
 }
 
-bool AP_ExternalAHRS_InertialSense::check_uart() {
-    if(!initialized) {
-        printf("UART not initialized!\n");
-        return false;
-    }
+void AP_ExternalAHRS_InertialSense::read_fifo() {
+    WITH_SEMAPHORE(dev->get_semaphore());
 
-    WITH_SEMAPHORE(sem);
-
-    if(!uart->available())
-        return false;
-
-    auto len = uart->read(buffer, MIN(uart->available(), 1024u));
-    is_comm_buffer_parse_messages(buffer, len, &comm);
-
-    return true;
-}
-
-void AP_ExternalAHRS_InertialSense::update_thread() {
-    if(!initialized) {
-        initialize();
-    }
-
-    while(true) {
-        if (!check_uart()) {
-            hal.scheduler->delay_microseconds(100);
-        }
-    }
+    memset(buffer, 0, sizeof(buffer));
+    dev->transfer(nullptr, 0, buffer, sizeof(buffer));
+    is_comm_buffer_parse_messages(buffer, sizeof(buffer), &comm);
 }
 
 uint8_t AP_ExternalAHRS_InertialSense::num_gps_sensors(void) const {
