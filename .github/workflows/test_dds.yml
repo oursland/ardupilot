@@ -140,7 +140,14 @@ jobs:
   build:
     runs-on: ubuntu-22.04
     container:
-      image: ardupilot/ardupilot-dev-ros:latest
+      # Pinned by digest for reproducible CI on the 4.6 branch. The ros image
+      # has no version tag newer than v0.1.3 (2023), whose microxrceddsgen and
+      # expired ROS apt key can no longer build this branch; this digest is the
+      # ardupilot/ardupilot-dev-ros:latest image as of 2026-01-09, whose
+      # generator emits the scoped DDS constants used by the AP_DDS source here.
+      # Do not move to a floating tag: an image rebuild would silently break the
+      # build again. To bump, pick a digest whose generator matches this source.
+      image: ardupilot/ardupilot-dev-ros@sha256:8ba3a5fd703e2b7a0a330d01aed4a12630fa643b442fc8381a5a7daa106337b6
       options: --user 1001
     strategy:
       fail-fast: false  # don't cancel if a job from the matrix fails
