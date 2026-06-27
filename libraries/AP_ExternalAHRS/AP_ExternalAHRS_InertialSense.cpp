@@ -29,6 +29,8 @@
 #include <AP_Baro/AP_Baro.h>
 #include <AP_BoardConfig/AP_BoardConfig.h>
 #include <AP_Compass/AP_Compass.h>
+#include <AP_Logger/AP_Logger.h>
+#include <AP_InertialSensor/AP_InertialSensor.h>
 #include <AP_ExternalAHRS/AP_ExternalAHRS.h>
 #include <AP_GPS/AP_GPS_FixType.h>
 #include <AP_GPS/AP_GPS.h>
@@ -46,6 +48,8 @@
 using eDataIDs = uint32_t;
 #define DID_NULL                  (eDataIDs)0   /** NULL (INVALID) */
 #define DID_DEV_INFO              (eDataIDs)1   /** (dev_info_t) Device information */
+#define DID_PIMU                  (eDataIDs)3   /** (pimu_t) Preintegrated IMU */
+#define DID_SYS_PARAMS            (eDataIDs)10  /** (sys_params_t) Runtime system parameters */
 #define DID_FLASH_CONFIG          (eDataIDs)12  /** (nvm_flash_cfg_t) Flash memory configuration */
 #define DID_GNSS1_POS             (eDataIDs)13  /** (gnss_pos_t) GNSS 1 position data */
 #define DID_GNSS2_POS             (eDataIDs)14  /** (gnss_pos_t) GNSS 2 position data */
@@ -63,6 +67,24 @@ using eDataIDs = uint32_t;
 static constexpr uint8_t  IO_CONFIG_GNSS2_TYPE_OFFSET = 25;
 static constexpr uint32_t IO_CONFIG_GNSS_TYPE_MASK    = 0x7U;
 #define IO_CONFIG_GNSS2_TYPE(ioConfig) (((ioConfig) >> IO_CONFIG_GNSS2_TYPE_OFFSET) & IO_CONFIG_GNSS_TYPE_MASK)
+
+// nvm_flash_cfg_t.sysCfgBits: disable the on-device INS EKF. With the EKF off
+// the IMU/PIMU dt (startupImuDtMs) is no longer clamped to 7 ms, and the INS
+// solution data sets (DID_INS_3, DID_INL2_NED_SIGMA) stop being produced.
+#define SYS_CFG_BITS_DISABLE_INS_EKF  0x00040000U
+
+// Internal IMU oversample period (ms) for IMU mode. Keep at the device default
+// 1 ms (1 kHz) so PIMU preintegrates over the full 1 kHz IMU stream (proper
+// antialiasing) before it is decimated to the nav-update output rate.
+static constexpr uint32_t IMU_MODE_IMU_DT_MS = 1;
+
+// Nav-update period (ms) for IMU mode. The device clamps startupNavDtMs to a
+// 4 ms minimum, and with the on-device EKF disabled the PIMU output follows the
+// nav-update period -> 4 ms = 250 Hz. We write *exactly* 4 (not less): a sub-4
+// value clamps to 4 on the device, then reads back as 4 != written and the
+// driver would rewrite + re-prompt for a power cycle every boot. Fresh units
+// default to 7 ms (143 Hz), so this write is what gets them to 250 Hz.
+static constexpr uint32_t IMU_MODE_NAV_DT_MS = 4;
 
 #define DEVINFO_MANUFACTURER_STRLEN 24
 #define DEVINFO_ADDINFO_STRLEN      24
@@ -474,6 +496,33 @@ struct PACKED AP_ExternalAHRS_InertialSense::barometer_t
     float       mslBar;
     float       barTemp;
     float       humidity;
+};
+
+struct PACKED AP_ExternalAHRS_InertialSense::pimu_t
+{
+    double      time;
+    float       dt;
+    uint32_t    status;
+    float       theta[3];
+    float       vel[3];
+};
+
+struct PACKED AP_ExternalAHRS_InertialSense::sys_params_t
+{
+    uint32_t    timeOfWeekMs;
+    uint32_t    insStatus;
+    uint32_t    hdwStatus;
+    float       imuTemp;
+    float       baroTemp;
+    float       mcuTemp;
+    uint32_t    sysStatus;
+    uint32_t    imuSamplePeriodMs;   // runtime IMU sample period (mirror of startupImuDtMs)
+    uint32_t    navOutputPeriodMs;   // runtime PIMU/nav output period (mirror of startupNavDtMs)
+    double      sensorTruePeriod;
+    uint32_t    flashCfgChecksum;    // device-side flash config checksum
+    uint32_t    navUpdatePeriodMs;   // runtime nav filter update period
+    uint32_t    genFaultCode;
+    double      upTime;
 };
 
 struct PACKED AP_ExternalAHRS_InertialSense::inl2_ned_sigma_t
@@ -986,14 +1035,29 @@ AP_ExternalAHRS_InertialSense::AP_ExternalAHRS_InertialSense(AP_ExternalAHRS *_f
     : AP_ExternalAHRS_backend(_frontend, _state)
 {
     dev = hal.spi->get_device("imx5");
+    if (!dev) {
+        GCS_SEND_TEXT(MAV_SEVERITY_ERROR, "InertialSense ExternalAHRS no SPI device");
+        return;
+    }
 
-    dev->set_speed(AP_HAL::Device::SPEED_LOW);
+    dev->set_speed(AP_HAL::Device::SPEED_HIGH);
 
     port_num = dev->bus_num();
 
-    initialize();
+    // Initialise the parser before the thread starts touching it. No SPI
+    // access happens here, so it is safe to do from the constructor.
+    is_comm_init(&comm, comm_buf, sizeof(comm_buf), nullptr);
+    instance = this;
+    is_comm_register_isb_handler(&comm, &AP_ExternalAHRS_InertialSense::isb_data_handler);
 
-    dev->register_periodic_callback(4 * AP_USEC_PER_MSEC, FUNCTOR_BIND_MEMBER(&AP_ExternalAHRS_InertialSense::read_fifo, void));
+    // All SPI I/O and message dispatch runs in a dedicated thread. The bus
+    // semaphore is only ever held around the transfer itself (see read_fifo),
+    // never across calls into AP::gps()/compass()/baro()/GCS, so there is no
+    // lock-order inversion with the main loop.
+    if (!hal.scheduler->thread_create(FUNCTOR_BIND_MEMBER(&AP_ExternalAHRS_InertialSense::update_thread, void),
+                                      "AHRS", 2048, AP_HAL::Scheduler::PRIORITY_SPI, 0)) {
+        AP_BoardConfig::allocation_error("InertialSense failed to allocate ExternalAHRS update thread");
+    }
 }
 
 int8_t AP_ExternalAHRS_InertialSense::get_port(void) const
@@ -1009,12 +1073,19 @@ const char* AP_ExternalAHRS_InertialSense::get_name() const
 bool AP_ExternalAHRS_InertialSense::healthy(void) const
 {
     uint32_t now = AP_HAL::millis();
+    if (use_as_imu()) {
+        // No on-device EKF/INS_3: base health on raw IMU and GNSS liveness.
+        return now - last_imu_pkt < 100 && now - last_gps_pkt < 500;
+    }
     return _healthy && now - last_gps_pkt < 500 && now - last_filter_pkt < 100;
 }
 
 bool AP_ExternalAHRS_InertialSense::initialised(void) const
 {
     uint32_t now = AP_HAL::millis();
+    if (use_as_imu()) {
+        return initialized && now - last_imu_pkt < 100 && now - last_gps_pkt < 500;
+    }
     return initialized && now - last_gps_pkt < 500 && now - last_filter_pkt < 100;
 }
 
@@ -1069,14 +1140,14 @@ int AP_ExternalAHRS_InertialSense::stop_message_broadcasting()
     int size;
 
     size = is_comm_write_to_buf(buffer, sizeof(buffer), &comm, PKT_TYPE_STOP_BROADCASTS_ALL_PORTS, 0, 0, 0, nullptr);
-    if(!dev->transfer(buffer, size, nullptr, 0)) {
-        GCS_SEND_TEXT(MAV_SEVERITY_ERROR, "IS: failed to stop all port broadcasts");
+    if(!write_buffer(size)) {
+        queue_gcs_text(MAV_SEVERITY_ERROR, "IS: failed to stop all port broadcasts");
         return -3;
     }
 
     size = is_comm_write_to_buf(buffer, sizeof(buffer), &comm, PKT_TYPE_STOP_BROADCASTS_CURRENT_PORT, 0, 0, 0, nullptr);
-    if(!dev->transfer(buffer, size, nullptr, 0)) {
-        GCS_SEND_TEXT(MAV_SEVERITY_ERROR, "IS: failed to stop cur port broadcast");
+    if(!write_buffer(size)) {
+        queue_gcs_text(MAV_SEVERITY_ERROR, "IS: failed to stop cur port broadcast");
         return -3;
     }
 
@@ -1087,74 +1158,119 @@ int AP_ExternalAHRS_InertialSense::enable_message_broadcasting()
 {
     int size;
 
-    // Ask for INS_3 at the EAHRS-configured rate (device runs at 250 Hz)
-    const uint16_t ins3_period = MAX(1, 250 / get_rate());
-    size = is_comm_get_data_to_buf(buffer, sizeof(buffer), &comm, DID_INS_3, 0, 0, ins3_period);
-    if(!dev->transfer(buffer, size, nullptr, 0)) {
-        GCS_SEND_TEXT(MAV_SEVERITY_ERROR, "IS: failed to request DID_INS_3");
-        return -4;
+    // The broadcast period is a multiple of EACH data set's OWN source update
+    // rate, and those rates differ (the IS RMC delivers each sensor as soon as it
+    // is produced). From data_sets.h RMC comments: the nav/EKF sets (INS_3, INL2
+    // sigma) follow the nav rate; magnetometer source is ~10 ms (~100 Hz) and
+    // barometer ~8 ms (~125 Hz). Using one nav_rate base for all of them (the old
+    // bug) decimated the mag to ~20 Hz and baro to ~12 Hz — far slower than the
+    // comments claimed, which made compass calibration crawl.
+    const uint16_t nav_rate_hz       = 250;   // INS_3 / INL2 sigma / RTK misc base
+    const uint16_t baro_rate_hz      = 125;   // DID_BAROMETER source ~8 ms (~125 Hz)
+    const uint16_t eahrs_rate        = MAX(1, get_rate());
+    // INS_3 follows EAHRS_RATE but is capped: streaming the full nav solution at
+    // the 250 Hz IMU rate (EAHRS_RATE drives both IMU registration and PIMU)
+    // saturates the device COM TX and trips HDW_STATUS_ERR_COM_TX_LIMITED. 50 Hz
+    // is ample for a pose source; PIMU stays at the full IMU rate.
+    const uint16_t ins3_rate         = MIN(eahrs_rate, uint16_t(50));
+    const uint16_t ins3_period       = MAX(1, nav_rate_hz / ins3_rate); // INS_3 @ min(EAHRS_RATE, 50 Hz)
+    const uint16_t sigma_period      = MAX(1, nav_rate_hz / 10);   // INL2 covariances @ ~10 Hz
+    const uint16_t rtk_misc_period   = MAX(1, nav_rate_hz / 10);   // RTK DOP @ ~10 Hz
+    // Magnetometer at its full source rate (~100 Hz, period 1): it is a tiny
+    // payload, and the high sample rate makes compass calibration converge fast
+    // (the EKF downsamples internally as needed).
+    const uint16_t mag_period        = 1;                          // magnetometer @ ~100 Hz
+    const uint16_t baro_period       = MAX(1, baro_rate_hz / 25);  // barometer @ ~25 Hz
+
+    // DID_INS_3 is an on-device EKF output: only available (and only useful) in
+    // INS mode. In IMU mode the device's EKF is disabled and ArduPilot's EKF3
+    // fuses the raw PIMU instead.
+    if (!use_as_imu()) {
+        size = is_comm_get_data_to_buf(buffer, sizeof(buffer), &comm, DID_INS_3, 0, 0, ins3_period);
+        if(!write_buffer(size)) {
+            queue_gcs_text(MAV_SEVERITY_ERROR, "IS: failed to request DID_INS_3");
+            return -4;
+        }
     }
 
     // Ask for GPS message at period of 200ms (200ms source period x 1).  Offset and size can be left at 0 unless you want to just pull a specific field from a data set.
     size = is_comm_get_data_to_buf(buffer, sizeof(buffer), &comm, DID_GNSS1_POS, 0, 0, 1);
-    if(!dev->transfer(buffer, size, nullptr, 0)) {
-        GCS_SEND_TEXT(MAV_SEVERITY_ERROR, "IS: failed to request DID_GNSS1_POS");
+    if(!write_buffer(size)) {
+        queue_gcs_text(MAV_SEVERITY_ERROR, "IS: failed to request DID_GNSS1_POS");
+        return -5;
+    }
+
+    // PIMU is the EKF IMU feed in both modes: the oversampled,
+    // coning/sculling-corrected, antialiased delta-theta/delta-velocity that is
+    // the IMX5's actual value over a plain raw IMU (the onboard IIM-42653 already
+    // provides raw samples). Request every sample (imu_sample_duration = 1). PIMU
+    // rate follows the nav-update period: 250 Hz with the on-device EKF.
+    size = is_comm_get_data_to_buf(buffer, sizeof(buffer), &comm, DID_PIMU, 0, 0, imu_sample_duration);
+    if(!write_buffer(size)) {
+        queue_gcs_text(MAV_SEVERITY_ERROR, "IS: failed to request DID_PIMU");
         return -5;
     }
 
     size = is_comm_get_data_to_buf(buffer, sizeof(buffer), &comm, DID_GNSS1_VEL, 0, 0, 1);
-    if(!dev->transfer(buffer, size, nullptr, 0)) {
-        GCS_SEND_TEXT(MAV_SEVERITY_ERROR, "IS: failed to request DID_GNSS1_VEL");
+    if(!write_buffer(size)) {
+        queue_gcs_text(MAV_SEVERITY_ERROR, "IS: failed to request DID_GNSS1_VEL");
         return -5;
     }
 
-    size = is_comm_get_data_to_buf(buffer, sizeof(buffer), &comm, DID_GNSS2_POS, 0, 0, 1);
-    if(!dev->transfer(buffer, size, nullptr, 0)) {
-        GCS_SEND_TEXT(MAV_SEVERITY_ERROR, "IS: failed to request DID_GNSS2_POS");
+    // DID_GNSS2_* is requested later, only if flash config reports a second
+    // GNSS is configured (see handle_flash_config_message).
+
+    size = is_comm_get_data_to_buf(buffer, sizeof(buffer), &comm, DID_GNSS1_RTK_POS_MISC, 0, 0, rtk_misc_period);
+    if(!write_buffer(size)) {
+        queue_gcs_text(MAV_SEVERITY_ERROR, "IS: failed to request DID_GNSS1_RTK_POS_MISC");
         return -5;
     }
 
-    size = is_comm_get_data_to_buf(buffer, sizeof(buffer), &comm, DID_GNSS2_VEL, 0, 0, 1);
-    if(!dev->transfer(buffer, size, nullptr, 0)) {
-        GCS_SEND_TEXT(MAV_SEVERITY_ERROR, "IS: failed to request DID_GNSS2_VEL");
-        return -5;
-    }
-
-    size = is_comm_get_data_to_buf(buffer, sizeof(buffer), &comm, DID_GNSS1_RTK_POS_MISC, 0, 0, 1);
-    if(!dev->transfer(buffer, size, nullptr, 0)) {
-        GCS_SEND_TEXT(MAV_SEVERITY_ERROR, "IS: failed to request DID_GNSS1_RTK_POS_MISC");
-        return -5;
-    }
-
-    size = is_comm_get_data_to_buf(buffer, sizeof(buffer), &comm, DID_MAGNETOMETER, 0, 0, 1);
-    if(!dev->transfer(buffer, size, nullptr, 0)) {
-        GCS_SEND_TEXT(MAV_SEVERITY_ERROR, "IS: failed to request DID_MAGNETOMETER");
+    size = is_comm_get_data_to_buf(buffer, sizeof(buffer), &comm, DID_MAGNETOMETER, 0, 0, mag_period);
+    if(!write_buffer(size)) {
+        queue_gcs_text(MAV_SEVERITY_ERROR, "IS: failed to request DID_MAGNETOMETER");
         return -6;
     }
 
-    size = is_comm_get_data_to_buf(buffer, sizeof(buffer), &comm, DID_BAROMETER, 0, 0, 1);
-    if(!dev->transfer(buffer, size, nullptr, 0)) {
-        GCS_SEND_TEXT(MAV_SEVERITY_ERROR, "IS: failed to request DID_BAROMETER");
+    size = is_comm_get_data_to_buf(buffer, sizeof(buffer), &comm, DID_BAROMETER, 0, 0, baro_period);
+    if(!write_buffer(size)) {
+        queue_gcs_text(MAV_SEVERITY_ERROR, "IS: failed to request DID_BAROMETER");
         return -6;
     }
 
-    size = is_comm_get_data_to_buf(buffer, sizeof(buffer), &comm, DID_INL2_NED_SIGMA, 0, 0, 1);
-    if(!dev->transfer(buffer, size, nullptr, 0)) {
-        GCS_SEND_TEXT(MAV_SEVERITY_ERROR, "IS: failed to request DID_INL2_NED_SIGMA");
-        return -6;
+    // INL2 covariances are an on-device EKF output: INS mode only.
+    if (!use_as_imu()) {
+        size = is_comm_get_data_to_buf(buffer, sizeof(buffer), &comm, DID_INL2_NED_SIGMA, 0, 0, sigma_period);
+        if(!write_buffer(size)) {
+            queue_gcs_text(MAV_SEVERITY_ERROR, "IS: failed to request DID_INL2_NED_SIGMA");
+            return -6;
+        }
+    }
+
+    // Runtime system parameters: streamed at a low rate so we can compare the
+    // device's *actual* IMU/nav periods (imuSamplePeriodMs, navOutputPeriodMs)
+    // against what we wrote to flash. navOutputPeriodMs is the PIMU output-rate
+    // governor; if it disagrees with startupNavDtMs the device is clamping or
+    // ignoring our flash config (e.g. flashCfgChecksum mismatch). Diagnostic for
+    // the FW 3.0.x rate cap.
+    const uint16_t sys_params_period = MAX(1, nav_rate_hz / 5);   // ~5 Hz
+    size = is_comm_get_data_to_buf(buffer, sizeof(buffer), &comm, DID_SYS_PARAMS, 0, 0, sys_params_period);
+    if(!write_buffer(size)) {
+        queue_gcs_text(MAV_SEVERITY_ERROR, "IS: failed to request DID_SYS_PARAMS");
+        return -7;
     }
 
     // request flash config once to determine number of GPS sensors
     size = is_comm_get_data_to_buf(buffer, sizeof(buffer), &comm, DID_FLASH_CONFIG, 0, 0, 0);
-    if(!dev->transfer(buffer, size, nullptr, 0)) {
-        GCS_SEND_TEXT(MAV_SEVERITY_ERROR, "IS: failed to request DID_FLASH_CONFIG");
+    if(!write_buffer(size)) {
+        queue_gcs_text(MAV_SEVERITY_ERROR, "IS: failed to request DID_FLASH_CONFIG");
         return -7;
     }
 
     // request a device info message
     size = is_comm_get_data_to_buf(buffer, sizeof(buffer), &comm, DID_DEV_INFO, 0, 0, 0);
-    if(!dev->transfer(buffer, size, nullptr, 0)) {
-        GCS_SEND_TEXT(MAV_SEVERITY_ERROR, "IS: failed to request DID_DEV_INFO");
+    if(!write_buffer(size)) {
+        queue_gcs_text(MAV_SEVERITY_ERROR, "IS: failed to request DID_DEV_INFO");
         return -6;
     }
 
@@ -1163,137 +1279,203 @@ int AP_ExternalAHRS_InertialSense::enable_message_broadcasting()
 
 void AP_ExternalAHRS_InertialSense::initialize()
 {
-    WITH_SEMAPHORE(dev->get_semaphore());
-
-    is_comm_init(&comm, comm_buf, sizeof(comm_buf), nullptr);
-
-    instance = this;
-    is_comm_register_isb_handler(&comm, &AP_ExternalAHRS_InertialSense::isb_data_handler);
-
+    // Runs in the update thread. Each SPI transfer takes the bus semaphore
+    // for the duration of the transfer only (see write_buffer); we never hold
+    // it across the 500ms settle delay or the GCS error reports below.
     int error = 0;
 
     if ((error = stop_message_broadcasting())) {
-        GCS_SEND_TEXT(MAV_SEVERITY_ERROR, "IS: stop_message_broadcasting failed %d", error);
+        queue_gcs_text(MAV_SEVERITY_ERROR, "IS: stop_message_broadcasting failed %d", error);
         return;
     }
     hal.scheduler->delay(500);
 
     if ((error = enable_message_broadcasting())) {
-        GCS_SEND_TEXT(MAV_SEVERITY_ERROR, "IS: enable_message_broadcasting failed %d", error);
+        queue_gcs_text(MAV_SEVERITY_ERROR, "IS: enable_message_broadcasting failed %d", error);
         return;
     }
 
     initialized = true;
 }
 
+void AP_ExternalAHRS_InertialSense::update_thread()
+{
+    initialize();
+
+    while (true) {
+        read_fifo();
+
+        // DID_FLASH_CONFIG is requested once (one-shot GET) during init, but that
+        // single response can be missed during the device's own boot. If it never
+        // arrives, the mode config (sysCfgBits: on-device EKF enable/disable) is
+        // never applied — on a fresh (param-wiped) device that silently leaves the
+        // wrong mode. Re-request every 500 ms until it has been received+applied.
+        if (initialized && !flash_config_checked) {
+            const uint32_t now = AP_HAL::millis();
+            if (now - last_flash_cfg_req_ms >= 500) {
+                last_flash_cfg_req_ms = now;
+                const int n = is_comm_get_data_to_buf(buffer, sizeof(buffer), &comm,
+                                                      DID_FLASH_CONFIG, 0, 0, 0);
+                write_buffer(n);
+            }
+        }
+
+        hal.scheduler->delay_microseconds(2000);
+    }
+}
+
+// Transfer the TX scratch buffer to the device, taking the bus semaphore only
+// for the duration of the transfer. Returns false on a zero-length packet or a
+// failed transfer so callers can report without holding the bus lock.
+bool AP_ExternalAHRS_InertialSense::write_buffer(int size)
+{
+    if (size <= 0) {
+        return false;
+    }
+    WITH_SEMAPHORE(dev->get_semaphore());
+    return dev->transfer(buffer, (uint32_t)size, nullptr, 0);
+}
+
 void AP_ExternalAHRS_InertialSense::handle_ins3_message(ins_3_t* ins)
 {
     last_filter_pkt = AP_HAL::millis();
 
-    WITH_SEMAPHORE(state.sem);
+    {
+        WITH_SEMAPHORE(state.sem);
 
-    Quaternion q(ins->qn2b[0], ins->qn2b[1], ins->qn2b[2], ins->qn2b[3]);
-    state.quat = q;
-    state.have_quaternion = true;
+        Quaternion q(ins->qn2b[0], ins->qn2b[1], ins->qn2b[2], ins->qn2b[3]);
+        state.quat = q;
+        state.have_quaternion = true;
 
-    Vector3f uvw(ins->uvw[0], ins->uvw[1], ins->uvw[2]);
-    state.velocity = q * uvw;
-    state.have_velocity = true;
+        Vector3f uvw(ins->uvw[0], ins->uvw[1], ins->uvw[2]);
+        state.velocity = q * uvw;
+        state.have_velocity = true;
 
-    state.location = Location{
-        (int32_t)(ins->lla[0] * 1e7),
-        (int32_t)(ins->lla[1] * 1e7),
-        (int32_t)(ins->msl * 100),
-        Location::AltFrame::ABSOLUTE};
-    state.have_location = true;
-    state.last_location_update_us = AP_HAL::micros();
+        state.location = Location{
+            (int32_t)(ins->lla[0] * 1e7),
+            (int32_t)(ins->lla[1] * 1e7),
+            (int32_t)(ins->msl * 100),
+            Location::AltFrame::ABSOLUTE};
+        state.have_location = true;
+        state.last_location_update_us = AP_HAL::micros();
 
-    switch ((GnssNavFixStatus)INS_STATUS_NAV_FIX_STATUS(ins->insStatus)) {
-    case GnssNavFixStatus::GNSS_NAV_FIX_NONE:
-        _fix_type = AP_GPS_FixType::NONE;
-        break;
+        switch ((GnssNavFixStatus)INS_STATUS_NAV_FIX_STATUS(ins->insStatus)) {
+        case GnssNavFixStatus::GNSS_NAV_FIX_NONE:
+            _fix_type = AP_GPS_FixType::NONE;
+            break;
 
-    case GnssNavFixStatus::GNSS_NAV_FIX_POSITIONING_3D:
-        _fix_type = AP_GPS_FixType::FIX_3D;
-        break;
+        case GnssNavFixStatus::GNSS_NAV_FIX_POSITIONING_3D:
+            _fix_type = AP_GPS_FixType::FIX_3D;
+            break;
 
-    case GnssNavFixStatus::GNSS_NAV_FIX_POSITIONING_RTK_FLOAT:
-        _fix_type = AP_GPS_FixType::RTK_FLOAT;
-        break;
+        case GnssNavFixStatus::GNSS_NAV_FIX_POSITIONING_RTK_FLOAT:
+            _fix_type = AP_GPS_FixType::RTK_FLOAT;
+            break;
 
-    case GnssNavFixStatus::GNSS_NAV_FIX_POSITIONING_RTK_FIX:
-        _fix_type = AP_GPS_FixType::RTK_FIXED;
-        break;
+        case GnssNavFixStatus::GNSS_NAV_FIX_POSITIONING_RTK_FIX:
+            _fix_type = AP_GPS_FixType::RTK_FIXED;
+            break;
 
-    default:
-        _fix_type = AP_GPS_FixType::NO_GPS;
-    }
+        default:
+            _fix_type = AP_GPS_FixType::NO_GPS;
+        }
 
-    if (_fix_type >= AP_GPS_FixType::FIX_3D && !state.have_origin) {
-        state.origin = state.location;
-        state.have_origin = true;
+        if (_fix_type >= AP_GPS_FixType::FIX_3D && !state.have_origin) {
+            state.origin = state.location;
+            state.have_origin = true;
+        }
     }
 
     const uint32_t hdwStatus = ins->hdwStatus;
     const bool hardware_healthy = (hdwStatus & HDW_STATUS_ERROR_MASK) == HDW_STATUS_BIT_PASSED;
 
-    WITH_SEMAPHORE(sem);
-    const bool was_healthy = _healthy;
-    _healthy = hardware_healthy;
+    bool was_healthy;
+    {
+        WITH_SEMAPHORE(sem);
+        was_healthy = _healthy;
+        _healthy = hardware_healthy;
+    }
 
     // Only report diagnostics on the transition to unhealthy to avoid flooding
-    // the GCS at the INS_3 message rate while semaphores are held.
+    // the GCS at the INS_3 message rate. These run with no lock held.
     if (!hardware_healthy && was_healthy) {
         const uint32_t bit_state = hdwStatus & HDW_STATUS_BIT_MASK;
 
-        GCS_SEND_TEXT(MAV_SEVERITY_WARNING, "IS: hdwStatus 0x%08" PRIx32, hdwStatus);
+        queue_gcs_text(MAV_SEVERITY_WARNING, "IS: hdwStatus 0x%08" PRIx32, hdwStatus);
 
         // BIT state
         if (bit_state == HDW_STATUS_BIT_RUNNING)
-            GCS_SEND_TEXT(MAV_SEVERITY_WARNING, "IS: BIT running");
+            queue_gcs_text(MAV_SEVERITY_WARNING, "IS: BIT running");
         else if (bit_state == HDW_STATUS_BIT_FAILED)
-            GCS_SEND_TEXT(MAV_SEVERITY_WARNING, "IS: BIT failed");
+            queue_gcs_text(MAV_SEVERITY_WARNING, "IS: BIT failed");
         else if (bit_state != HDW_STATUS_BIT_PASSED)
-            GCS_SEND_TEXT(MAV_SEVERITY_WARNING, "IS: BIT not started (0x%" PRIx32 ")", bit_state);
+            queue_gcs_text(MAV_SEVERITY_WARNING, "IS: BIT not started (0x%" PRIx32 ")", bit_state);
 
         // Individual error bits
         if (hdwStatus & HDW_STATUS_FAULT_SYS_CRITICAL) {
-            GCS_SEND_TEXT(MAV_SEVERITY_CRITICAL, "IS: critical system fault");
+            queue_gcs_text(MAV_SEVERITY_CRITICAL, "IS: critical system fault");
         }
         if (hdwStatus & HDW_STATUS_IMU_FAULT_REJECT_GYR) {
-            GCS_SEND_TEXT(MAV_SEVERITY_CRITICAL, "IS: redundant gyro rejected");
+            queue_gcs_text(MAV_SEVERITY_CRITICAL, "IS: redundant gyro rejected");
         }
         if (hdwStatus & HDW_STATUS_IMU_FAULT_REJECT_ACC) {
-            GCS_SEND_TEXT(MAV_SEVERITY_CRITICAL, "IS: redundant accel rejected");
+            queue_gcs_text(MAV_SEVERITY_CRITICAL, "IS: redundant accel rejected");
         }
         if (hdwStatus & HDW_STATUS_SATURATION_GYR) {
-            GCS_SEND_TEXT(MAV_SEVERITY_WARNING, "IS: gyro saturation");
+            queue_gcs_text(MAV_SEVERITY_WARNING, "IS: gyro saturation");
         }
         if (hdwStatus & HDW_STATUS_SATURATION_ACC) {
-            GCS_SEND_TEXT(MAV_SEVERITY_WARNING, "IS: accel saturation");
+            queue_gcs_text(MAV_SEVERITY_WARNING, "IS: accel saturation");
         }
         if (hdwStatus & HDW_STATUS_SATURATION_MAG) {
-            GCS_SEND_TEXT(MAV_SEVERITY_WARNING, "IS: mag saturation");
+            queue_gcs_text(MAV_SEVERITY_WARNING, "IS: mag saturation");
         }
         if (hdwStatus & HDW_STATUS_SATURATION_BARO) {
-            GCS_SEND_TEXT(MAV_SEVERITY_WARNING, "IS: baro saturation");
+            queue_gcs_text(MAV_SEVERITY_WARNING, "IS: baro saturation");
         }
         if (hdwStatus & HDW_STATUS_ERR_GNSS_PPS_NOISE) {
-            GCS_SEND_TEXT(MAV_SEVERITY_WARNING, "IS: GPS PPS noise");
+            queue_gcs_text(MAV_SEVERITY_WARNING, "IS: GPS PPS noise");
         }
         if (hdwStatus & HDW_STATUS_ERR_COM_TX_LIMITED) {
-            GCS_SEND_TEXT(MAV_SEVERITY_WARNING, "IS: COM TX limited");
+            queue_gcs_text(MAV_SEVERITY_WARNING, "IS: COM TX limited");
         }
         if (hdwStatus & HDW_STATUS_ERR_COM_RX_OVERRUN) {
-            GCS_SEND_TEXT(MAV_SEVERITY_WARNING, "IS: COM RX overrun");
+            queue_gcs_text(MAV_SEVERITY_WARNING, "IS: COM RX overrun");
         }
         if (hdwStatus & HDW_STATUS_ERR_NO_GNSS_PPS) {
-            GCS_SEND_TEXT(MAV_SEVERITY_WARNING, "IS: no GPS PPS");
+            queue_gcs_text(MAV_SEVERITY_WARNING, "IS: no GPS PPS");
         }
         if (hdwStatus & HDW_STATUS_ERR_TEMPERATURE) {
-            GCS_SEND_TEXT(MAV_SEVERITY_WARNING, "IS: temperature fault");
+            queue_gcs_text(MAV_SEVERITY_WARNING, "IS: temperature fault");
         }
     }
+
+#if HAL_LOGGING_ENABLED
+    // Native-rate InertialSense INS3 reference solution, for comparison against
+    // ArduPilot's EKF3 estimate (XKF1) when PIMU is the EKF IMU source. Sol/Fix
+    // tell you when INS3 attitude is actually trustworthy (full NAV/AHRS
+    // solution with a GNSS fix); divergence outside those states is expected.
+    // Runs in the read thread with no lock held; AP_Logger writes are
+    // thread-safe.
+    float roll, pitch, yaw;
+    Quaternion(ins->qn2b[0], ins->qn2b[1], ins->qn2b[2], ins->qn2b[3]).to_euler(roll, pitch, yaw);
+    // @LoggerMessage: INS3
+    // @Description: InertialSense INS3 reference attitude and solution status
+    // @Field: TimeUS: Time since system startup
+    // @Field: Roll: INS3 euler roll
+    // @Field: Pitch: INS3 euler pitch
+    // @Field: Yaw: INS3 euler yaw
+    // @Field: Sol: INS3 solution status (3=NAV, 5=AHRS)
+    // @Field: Fix: GNSS nav fix status (0=none,1=3D,2=RTK float,3=RTK fix)
+    // @Field: InsSt: raw insStatus bitfield
+    AP::logger().WriteStreaming("INS3", "TimeUS,Roll,Pitch,Yaw,Sol,Fix,InsSt",
+                                "sddd---", "F000000", "QfffBBI",
+                                AP_HAL::micros64(),
+                                degrees(roll), degrees(pitch), degrees(yaw),
+                                (uint8_t)INS_STATUS_SOLUTION(ins->insStatus),
+                                (uint8_t)INS_STATUS_NAV_FIX_STATUS(ins->insStatus),
+                                (uint32_t)ins->insStatus);
+#endif
 }
 
 void AP_ExternalAHRS_InertialSense::handle_gnss_pos_message(gnss_pos_t* pos)
@@ -1340,6 +1522,12 @@ void AP_ExternalAHRS_InertialSense::handle_gnss_pos_message(gnss_pos_t* pos)
     gps_data_msg.msl_altitude = msl_altitude;
 
     gps_data_msg.hdop = pos->hAcc * 100;
+
+    // In IMU mode there is no INS_3, so drive the arming fix type from the GNSS
+    // solution. In INS mode handle_ins3_message owns _fix_type.
+    if (use_as_imu()) {
+        _fix_type = fix_type;
+    }
 }
 
 void AP_ExternalAHRS_InertialSense::handle_gnss_vel_message(gnss_vel_t* vel)
@@ -1361,6 +1549,10 @@ void AP_ExternalAHRS_InertialSense::handle_gnss_vel_message(gnss_vel_t* vel)
 
     uint8_t gps_instance;
     if (AP::gps().get_first_external_instance(gps_instance)) {
+        // AP_GPS_ExternalAHRS::handle_external() writes the backend state
+        // without locking; take the same semaphore AP_GPS::update() holds so
+        // the main loop never reads a half-updated GPS sample.
+        WITH_SEMAPHORE(AP::gps().get_semaphore());
         AP::gps().handle_external(gps_data_msg, gps_instance);
     }
 
@@ -1420,11 +1612,58 @@ void AP_ExternalAHRS_InertialSense::handle_gnss2_vel_message(gnss_vel_t* vel)
     for (uint8_t i = 0; i < GPS_MAX_RECEIVERS; i++) {
         if (AP::gps().get_type(i) == AP_GPS::GPS_TYPE_EXTERNAL_AHRS) {
             if (++n_external == 2) {
+                WITH_SEMAPHORE(AP::gps().get_semaphore());
                 AP::gps().handle_external(gps2_data_msg, i);
                 break;
             }
         }
     }
+}
+
+void AP_ExternalAHRS_InertialSense::handle_pimu_message(pimu_t* pimu)
+{
+    last_imu_pkt = AP_HAL::millis();
+
+    // PIMU carries preintegrated delta-angle (theta, rad) and delta-velocity
+    // (vel, m/s) accumulated over the interval dt (s). AP_InertialSensor wants
+    // instantaneous rates, so divide by the device-reported dt. Using the
+    // reported dt (not imu_sample_duration) keeps this correct regardless of
+    // the requested decimation period, since the device reports dt for the
+    // full integration interval.
+    const float dt = pimu->dt;
+    if (!(dt > 0)) {
+        // dt == 0 on the first sample (or a dropped one) would divide to inf/NaN.
+        return;
+    }
+
+    // One-shot diagnostic: the device-reported integration interval. With
+    // periodMultiple=1 this equals the PIMU output period, so it disambiguates a
+    // slow-generating device (dt large, e.g. 16ms/61Hz) from a transport-limited
+    // stream (dt small but few packets arrive). Compare against navOutputPeriodMs
+    // from DID_SYS_PARAMS.
+    const uint32_t now_ms = AP_HAL::millis();
+    if (pimu_reports < DIAG_REPORT_MAX &&
+        (pimu_reports == 0 || now_ms - last_pimu_report_ms >= DIAG_REPORT_INTERVAL_MS)) {
+        pimu_reports++;
+        last_pimu_report_ms = now_ms;
+        queue_gcs_text(MAV_SEVERITY_INFO, "IS: pimu dt=%.2fms (%.0fHz)",
+                       (double)(dt * 1000.0f), (double)(dt > 0 ? 1.0f / dt : 0.0f));
+    }
+    const Vector3f accel{pimu->vel[0] / dt, pimu->vel[1] / dt, pimu->vel[2] / dt};
+    const Vector3f gyro{pimu->theta[0] / dt, pimu->theta[1] / dt, pimu->theta[2] / dt};
+
+    {
+        WITH_SEMAPHORE(state.sem);
+        state.accel = accel;
+        state.gyro = gyro;
+    }
+
+    AP_ExternalAHRS::ins_data_message_t ins {
+        accel: accel,
+        gyro: gyro,
+        temperature: _imu_temperature
+    };
+    AP::ins().handle_external(ins);
 }
 
 // Condensed nvm_flash_cfg_t from data_sets.h — only the fields needed to reach ioConfig.
@@ -1459,13 +1698,119 @@ void AP_ExternalAHRS_InertialSense::handle_flash_config_message(const uint8_t *r
     nvm_flash_cfg_t cfg;
     memcpy(&cfg, raw, sizeof(cfg));
     _num_gps_sensors = (IO_CONFIG_GNSS2_TYPE(cfg.ioConfig) != 0) ? 2 : 1;
+
+    // Capture the startup periods so the periodic sys_params diagnostic can show
+    // the flash-vs-runtime comparison even though flash config is requested only
+    // once (period 0) and its one-shot print is lost to the late logger start.
+    cfg_nav_dt_ms = cfg.startupNavDtMs;
+    cfg_imu_dt_ms = cfg.startupImuDtMs;
+
+    // Now that we know the GNSS configuration, subscribe to the second GNSS
+    // only if it exists, and only once. Runs in the read thread; write_buffer
+    // re-takes the bus semaphore just for the transfer.
+    if (_num_gps_sensors >= 2 && !gnss2_subscribed) {
+        gnss2_subscribed = true;
+        int sz = is_comm_get_data_to_buf(buffer, sizeof(buffer), &comm, DID_GNSS2_POS, 0, 0, 1);
+        if (!write_buffer(sz)) {
+            queue_gcs_text(MAV_SEVERITY_ERROR, "IS: failed to request DID_GNSS2_POS");
+        }
+        sz = is_comm_get_data_to_buf(buffer, sizeof(buffer), &comm, DID_GNSS2_VEL, 0, 0, 1);
+        if (!write_buffer(sz)) {
+            queue_gcs_text(MAV_SEVERITY_ERROR, "IS: failed to request DID_GNSS2_VEL");
+        }
+    }
+
+    // Apply the device-side configuration for the selected mode. We only have
+    // the current flash config here, so write just the fields that differ.
+    // sysCfgBits/startupNavDtMs are startup values, so a power cycle is required
+    // for a change to take effect; subsequent boots match and don't rewrite.
+    if (!flash_config_checked) {
+        flash_config_checked = true;
+
+        // Report the device's current mode-relevant config for verification on
+        // the GCS: DISABLE_INS_EKF lives in sysCfgBits, and PIMU output rate =
+        // 1000 / startupNavDtMs.
+        queue_gcs_text(MAV_SEVERITY_INFO,
+                       "IS: cfg sys=0x%08" PRIx32 " nav=%" PRIu32 "ms imu=%" PRIu32 "ms",
+                       cfg.sysCfgBits, cfg.startupNavDtMs, cfg.startupImuDtMs);
+
+        const bool imu_mode = use_as_imu();
+        const uint32_t want_syscfg = imu_mode
+            ? (cfg.sysCfgBits | SYS_CFG_BITS_DISABLE_INS_EKF)
+            : (cfg.sysCfgBits & ~SYS_CFG_BITS_DISABLE_INS_EKF);
+        bool changed = false;
+        if (cfg.sysCfgBits != want_syscfg) {
+            changed = true;
+            if (!write_flash_config_field(offsetof(nvm_flash_cfg_t, sysCfgBits),
+                                          &want_syscfg, sizeof(want_syscfg))) {
+                queue_gcs_text(MAV_SEVERITY_ERROR, "IS: failed to write sysCfgBits");
+            }
+        }
+        // IMU mode: with the on-device EKF disabled (sysCfgBits above) the PIMU
+        // output follows the nav-update period. Force it to the 4 ms device
+        // minimum (250 Hz) and keep startupImuDtMs at the 1 ms default so PIMU
+        // preintegrates the full 1 kHz IMU stream. Fresh units default to
+        // startupNavDtMs=7 ms (143 Hz), so without this write they only reach
+        // 143 Hz. Writing exactly 4 (the clamp floor) sticks; a sub-4 value would
+        // clamp to 4, read back != written, and re-prompt every boot.
+        if (cfg.startupNavDtMs != IMU_MODE_NAV_DT_MS) {
+            changed = true;
+            const uint32_t want_nav_dt = IMU_MODE_NAV_DT_MS;
+            if (!write_flash_config_field(offsetof(nvm_flash_cfg_t, startupNavDtMs),
+                                            &want_nav_dt, sizeof(want_nav_dt))) {
+                queue_gcs_text(MAV_SEVERITY_ERROR, "IS: failed to write startupNavDtMs");
+            }
+        }
+        if (cfg.startupImuDtMs != IMU_MODE_IMU_DT_MS) {
+            changed = true;
+            const uint32_t want_imu_dt = IMU_MODE_IMU_DT_MS;
+            if (!write_flash_config_field(offsetof(nvm_flash_cfg_t, startupImuDtMs),
+                                            &want_imu_dt, sizeof(want_imu_dt))) {
+                queue_gcs_text(MAV_SEVERITY_ERROR, "IS: failed to write startupImuDtMs");
+            }
+        }
+        if (changed) {
+            // Startup-config writes only take effect on the device's next boot.
+            // A driver-issued soft-reset (DID_SYS_CMD) was tried but applied
+            // before the asynchronous sysCfgBits flash write committed, so the
+            // device rebooted on the stale (EKF-on) config -> PIMU stuck at the
+            // 71 Hz EKF-on floor. A manual power cycle gives the flash ample time
+            // to commit, so prompt for one.
+            queue_gcs_text(MAV_SEVERITY_WARNING, "IS: %s mode written, power-cycle IMX to apply",
+                           imu_mode ? "IMU" : "INS");
+        }
+    }
+}
+
+bool AP_ExternalAHRS_InertialSense::use_as_imu() const
+{
+    return option_is_set(AP_ExternalAHRS::OPTIONS::INERTIALSENSE_USE_AS_IMU);
+}
+
+bool AP_ExternalAHRS_InertialSense::write_flash_config_field(uint16_t offset, const void *data, uint16_t size)
+{
+    const int n = is_comm_write_to_buf(buffer, sizeof(buffer), &comm, PKT_TYPE_SET_DATA,
+                                       DID_FLASH_CONFIG, size, offset, data);
+    return write_buffer(n);
 }
 
 void AP_ExternalAHRS_InertialSense::handle_magnetometer_message(magnetometer_t* _mag)
 {
+    // One-shot diagnostic of the raw device values (microtesla). Earth's field
+    // is ~25-65 uT; a much smaller or static reading points at the device, not
+    // our scaling.
+    if (!mag_reported) {
+        mag_reported = true;
+        queue_gcs_text(MAV_SEVERITY_INFO, "IS: mag %.1f %.1f %.1f uT",
+                       (double)_mag->mag[0], (double)_mag->mag[1], (double)_mag->mag[2]);
+    }
+
 #if AP_COMPASS_EXTERNALAHRS_ENABLED
     AP_ExternalAHRS::mag_data_message_t mag;
-    mag.field = Vector3f{_mag->mag[0], _mag->mag[1], _mag->mag[2]};
+    // DID_MAGNETOMETER is in microtesla; AP_Compass expects milliGauss (1 uT = 10 mGauss).
+    // Without this scale the field reads ~10x low and compass calibration rejects
+    // every sample (field strength below threshold), so cal never progresses.
+    mag.field = Vector3f{_mag->mag[0], _mag->mag[1], _mag->mag[2]} * 10.0f;
 
     AP::compass().handle_external(mag);
 #endif
@@ -1473,6 +1818,21 @@ void AP_ExternalAHRS_InertialSense::handle_magnetometer_message(magnetometer_t* 
 
 void AP_ExternalAHRS_InertialSense::handle_barometer_message(barometer_t* bar)
 {
+    // PIMU carries no temperature, so use the device's barometer temperature
+    // (same enclosure as the IMU) for the IMU sample temperature. Captured
+    // unconditionally so it is available even when the baro frontend is disabled.
+    _imu_temperature = bar->barTemp;
+
+    // Capture the raw values + a receive counter for the periodic diagnostic in
+    // handle_sys_params_message. That path fires regardless of whether baro
+    // arrives, so baro_rx_count==0 there means DID_BAROMETER is never delivered,
+    // vs count>0 with kPa==0 meaning the device sends an all-zero (absent/disabled)
+    // baro. (A one-shot here is lost to the ~10 s late start of dataflash logging.)
+    baro_rx_count++;
+    last_baro_kpa  = bar->bar;
+    last_baro_temp = bar->barTemp;
+    last_baro_msl  = bar->mslBar;
+
 #if AP_BARO_EXTERNALAHRS_ENABLED
     AP_ExternalAHRS::baro_data_message_t baro;
     baro.instance = 0;
@@ -1491,6 +1851,44 @@ void AP_ExternalAHRS_InertialSense::handle_inl2_ned_sigma_message(inl2_ned_sigma
     pos_cov = pos_std * pos_std;
     vel_cov = vel_std * vel_std;
     hgt_cov = pos_std * pos_std;
+}
+
+void AP_ExternalAHRS_InertialSense::handle_sys_params_message(sys_params_t *sys)
+{
+    // One-shot diagnostic of the device's *runtime* periods (vs the flash values
+    // printed by handle_flash_config_message). On FW 3.0.x the PIMU rate is
+    // capped: if navOutputPeriodMs here is larger than the startupNavDtMs we
+    // wrote, the device is clamping/ignoring our config. flashCfgChecksum lets
+    // us see whether our partial (checksum-less) writes left the config in a
+    // state the firmware rejects.
+    const uint32_t now = AP_HAL::millis();
+    if (sys_params_reports < DIAG_REPORT_MAX &&
+        (sys_params_reports == 0 || now - last_sys_params_report_ms >= DIAG_REPORT_INTERVAL_MS)) {
+        sys_params_reports++;
+        last_sys_params_report_ms = now;
+        queue_gcs_text(MAV_SEVERITY_INFO,
+                       "IS: run imu=%" PRIu32 "ms navOut=%" PRIu32 "ms navUpd=%" PRIu32 "ms",
+                       sys->imuSamplePeriodMs, sys->navOutputPeriodMs, sys->navUpdatePeriodMs);
+        queue_gcs_text(MAV_SEVERITY_INFO,
+                       "IS: run cksum=0x%08" PRIx32 " fault=0x%08" PRIx32,
+                       sys->flashCfgChecksum, sys->genFaultCode);
+        // Flash startup periods for direct comparison: if flash nav != runtime
+        // navOut, the device is clamping/ignoring our config. Skip until the
+        // (one-shot) flash-config message has actually arrived, otherwise the
+        // first sys_params report (which can beat it) would print 0ms/0ms.
+        if (cfg_imu_dt_ms != 0) {
+            queue_gcs_text(MAV_SEVERITY_INFO,
+                           "IS: cfg(flash) nav=%" PRIu32 "ms imu=%" PRIu32 "ms",
+                           cfg_nav_dt_ms, cfg_imu_dt_ms);
+        }
+        // Baro liveness: n is the DID_BAROMETER receive count. n==0 -> the device
+        // never sends a baro (subscription/production issue); n>0 with kPa~0 ->
+        // it sends an all-zero (absent/disabled) baro. Earth surface ~101 kPa.
+        queue_gcs_text(MAV_SEVERITY_INFO,
+                       "IS: baro n=%" PRIu32 " %.2fkPa %.1fC msl=%.1f",
+                       baro_rx_count, (double)last_baro_kpa, (double)last_baro_temp,
+                       (double)last_baro_msl);
+    }
 }
 
 void AP_ExternalAHRS_InertialSense::handle_dev_info_message(dev_info_t *dev_info)
@@ -1521,8 +1919,8 @@ void AP_ExternalAHRS_InertialSense::handle_dev_info_message(dev_info_t *dev_info
 
     hal.util->snprintf(_name, sizeof(_name), "%s %s", dev_info->manufacturer, hardware_type);
 
-    GCS_SEND_TEXT(MAV_SEVERITY_INFO, "IS: %s SN:%" PRIu32, _name, dev_info->serialNumber);
-    GCS_SEND_TEXT(MAV_SEVERITY_INFO, "IS: HW %u.%u.%u FW %u.%u.%u",
+    queue_gcs_text(MAV_SEVERITY_INFO, "IS: %s SN:%" PRIu32, _name, dev_info->serialNumber);
+    queue_gcs_text(MAV_SEVERITY_INFO, "IS: HW %u.%u.%u FW %u.%u.%u",
                   dev_info->hardwareVer[0], dev_info->hardwareVer[1], dev_info->hardwareVer[2],
                   dev_info->firmwareVer[0], dev_info->firmwareVer[1], dev_info->firmwareVer[2]);
 }
@@ -1534,12 +1932,12 @@ void AP_ExternalAHRS_InertialSense::handle_bit_message(bit_t* bit)
     }
 
     if (bit->hdwBitStatus & HDW_BIT_FAILED_MASK) {
-        GCS_SEND_TEXT(MAV_SEVERITY_CRITICAL, "IS: hardware BIT failed (0x%08" PRIx32 ")", bit->hdwBitStatus);
+        queue_gcs_text(MAV_SEVERITY_CRITICAL, "IS: hardware BIT failed (0x%08" PRIx32 ")", bit->hdwBitStatus);
         return;
     }
 
     if (bit->calBitStatus & CAL_BIT_FAILED_MASK) {
-        GCS_SEND_TEXT(MAV_SEVERITY_CRITICAL, "IS: calibration BIT failed (0x%08" PRIx32 ")", bit->calBitStatus);
+        queue_gcs_text(MAV_SEVERITY_CRITICAL, "IS: calibration BIT failed (0x%08" PRIx32 ")", bit->calBitStatus);
         return;
     }
 
@@ -1547,14 +1945,56 @@ void AP_ExternalAHRS_InertialSense::handle_bit_message(bit_t* bit)
     _healthy = true;
 }
 
+// Producer (read thread): queue a GCS message for the main thread to send.
+void AP_ExternalAHRS_InertialSense::queue_gcs_text(uint8_t severity, const char *fmt, ...)
+{
+    WITH_SEMAPHORE(sem);
+    const uint8_t next = (pending_text_head + 1) % PENDING_TEXT_QUEUE_SIZE;
+    if (next == pending_text_tail) {
+        // Queue full; drop the oldest-but-one by skipping this message rather
+        // than blocking the read thread.
+        return;
+    }
+    pending_text[pending_text_head].severity = severity;
+    va_list ap;
+    va_start(ap, fmt);
+    hal.util->vsnprintf(pending_text[pending_text_head].text,
+                        sizeof(pending_text[pending_text_head].text), fmt, ap);
+    va_end(ap);
+    pending_text_head = next;
+}
+
+// Consumer (main thread): drain queued messages and send them to the GCS.
+void AP_ExternalAHRS_InertialSense::send_pending_text()
+{
+    while (true) {
+        pending_text_t msg;
+        {
+            WITH_SEMAPHORE(sem);
+            if (pending_text_tail == pending_text_head) {
+                break;
+            }
+            msg = pending_text[pending_text_tail];
+            pending_text_tail = (pending_text_tail + 1) % PENDING_TEXT_QUEUE_SIZE;
+        }
+        // Sent with no lock held, from the main thread.
+        GCS_SEND_TEXT((MAV_SEVERITY)msg.severity, "%s", msg.text);
+    }
+}
+
 void AP_ExternalAHRS_InertialSense::update()
 {
+    send_pending_text();
 }
 
 int AP_ExternalAHRS_InertialSense::parse_isb_data(void* ctx, p_data_t* data, port_handle_t port)
 {
     switch (data->hdr.id)
     {
+    case DID_PIMU:
+        handle_pimu_message((pimu_t*)data->ptr);
+        break;
+
     case DID_INS_3:
         handle_ins3_message((ins_3_t*)data->ptr);
         break;
@@ -1583,8 +2023,16 @@ int AP_ExternalAHRS_InertialSense::parse_isb_data(void* ctx, p_data_t* data, por
         handle_magnetometer_message((magnetometer_t *)data->ptr);
         break;
 
+    case DID_BAROMETER:
+        handle_barometer_message((barometer_t *)data->ptr);
+        break;
+
     case DID_INL2_NED_SIGMA:
         handle_inl2_ned_sigma_message((inl2_ned_sigma_t *)data->ptr);
+        break;
+
+    case DID_SYS_PARAMS:
+        handle_sys_params_message((sys_params_t*)data->ptr);
         break;
 
     case DID_DEV_INFO:
@@ -1604,11 +2052,20 @@ int AP_ExternalAHRS_InertialSense::parse_isb_data(void* ctx, p_data_t* data, por
 
 void AP_ExternalAHRS_InertialSense::read_fifo()
 {
-    WITH_SEMAPHORE(dev->get_semaphore());
+    {
+        // Hold the bus semaphore only for the SPI transfer.
+        WITH_SEMAPHORE(dev->get_semaphore());
+        memset(rx_buffer, 0, sizeof(rx_buffer));
+        if (!dev->transfer(nullptr, 0, rx_buffer, sizeof(rx_buffer))) {
+            return;
+        }
+    }
 
-    memset(buffer, 0, sizeof(buffer));
-    dev->transfer(nullptr, 0, buffer, sizeof(buffer));
-    is_comm_buffer_parse_messages(buffer, sizeof(buffer), &comm);
+    // Parse and dispatch with the bus semaphore released. The message handlers
+    // call into AP::gps()/compass()/baro()/GCS and take state.sem; doing that
+    // while holding the bus lock would invert lock order against the main loop
+    // and hang it.
+    is_comm_buffer_parse_messages(rx_buffer, sizeof(rx_buffer), &comm);
 }
 
 uint8_t AP_ExternalAHRS_InertialSense::num_gps_sensors(void) const

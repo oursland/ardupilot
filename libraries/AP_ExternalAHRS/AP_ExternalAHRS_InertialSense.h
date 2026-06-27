@@ -58,6 +58,7 @@ private:
 
     // Forward declarations for ISB data-set payload types (defined in .cpp).
     struct dev_info_t;
+    struct pimu_t;
     struct ins_3_t;
     struct gnss_pos_t;
     struct gnss_vel_t;
@@ -65,6 +66,7 @@ private:
     struct magnetometer_t;
     struct barometer_t;
     struct inl2_ned_sigma_t;
+    struct sys_params_t;
     struct bit_t;
 
     // Opaque port handle (from base_port.h).
@@ -289,11 +291,28 @@ private:
 
     void initialize();
     void start();
+    void update_thread();
     void read_fifo();
+    bool write_buffer(int size);
+
+    // True when EAHRS_OPTIONS selects "use device as a raw IMU": the on-device
+    // EKF is disabled and we consume PIMU only (no INS solution messages).
+    bool use_as_imu() const;
+
+    // Partial write of a DID_FLASH_CONFIG field (SET_DATA with byte offset).
+    bool write_flash_config_field(uint16_t offset, const void *data, uint16_t size);
+
+    // Deferred GCS reporting. The read thread runs at PRIORITY_SPI and must not
+    // call GCS_SEND_TEXT directly: send_textv() fans out into AP_Logger,
+    // AP_Notify and the telemetry singletons, which are owned by the main loop.
+    // Instead the thread queues text here and update() (main thread) drains it.
+    void queue_gcs_text(uint8_t severity, const char *fmt, ...) FMT_PRINTF(3, 4);
+    void send_pending_text();
 
     int stop_message_broadcasting();
     int enable_message_broadcasting();
 
+    void handle_pimu_message(pimu_t* pimu);
     void handle_ins3_message(ins_3_t* ins);
     void handle_gnss_pos_message(gnss_pos_t* pos);
     void handle_gnss_vel_message(gnss_vel_t* vel);
@@ -304,6 +323,7 @@ private:
     void handle_magnetometer_message(magnetometer_t* mag);
     void handle_barometer_message(barometer_t* bar);
     void handle_inl2_ned_sigma_message(inl2_ned_sigma_t *sigmas);
+    void handle_sys_params_message(sys_params_t *sys);
     void handle_dev_info_message(dev_info_t *dev_info);
     void handle_bit_message(bit_t* bit);
     int parse_isb_data(void* ctx, p_data_t* data, port_handle_t port);
@@ -313,16 +333,84 @@ private:
     static int isb_data_handler(void* ctx, p_data_t* data, port_handle_t port) {
         return instance->parse_isb_data(ctx, data, port);
     }
-    bool initialized;
-    bool _healthy;
+    bool initialized = false;
+    bool _healthy = false;
     AP_GPS_FixType _fix_type = AP_GPS_FixType::NONE;
 
     uint32_t baudrate;
-    int8_t port_num;
-    uint8_t buffer[128];
+    int8_t port_num = -1;
+    uint8_t buffer[64];          // TX scratch (request/stop packets are small)
 
-    uint32_t last_gps_pkt;
-    uint32_t last_filter_pkt;
+    // RX drain buffer. The IMU sample rate seen by the EKF equals the rate at
+    // which complete PIMU packets are parsed, which is gated by how many bytes
+    // we pull off SPI per poll. 64 B / 2 ms (~32 KB/s) throttled the whole
+    // subscription set so PIMU only emerged at ~81 Hz. Drain a much larger
+    // chunk per poll so SPI bandwidth is no longer the limiter.
+    uint8_t rx_buffer[512];
+
+    // PIMU broadcast period, as a multiple of the device's preintegrated-IMU
+    // source rate (~290 Hz on the IMX5). This is the IMU feed for the EKF, so
+    // we want every sample: period 1. (A previous value of 4 decimated it 4:1,
+    // delivering only ~72 Hz to the EKF.)
+    int imu_sample_duration = 1;
+
+    // Latest IMU-sample temperature, sourced from the barometer message (PIMU
+    // carries none). Defaults to a benign value until the first baro message.
+    float _imu_temperature = 25.0f;
+
+    // True once DID_GNSS2_* has been subscribed (only when a second GNSS is
+    // present); prevents re-subscribing on repeated flash-config messages.
+    bool gnss2_subscribed = false;
+
+    // True once the device-side mode config (sysCfgBits/startupImuDtMs) has been
+    // checked against the selected mode; prevents repeated writes.
+    bool flash_config_checked = false;
+
+    // Last time (ms) we re-requested DID_FLASH_CONFIG while waiting for the
+    // one-shot GET response (see update_thread).
+    uint32_t last_flash_cfg_req_ms = 0;
+
+    // DID_BAROMETER liveness/values, reported periodically by the sys_params
+    // diagnostic (which fires even when no baro arrives). count==0 => never
+    // delivered; count>0 with kPa~0 => device sends an all-zero baro.
+    uint32_t baro_rx_count = 0;
+    float    last_baro_kpa = 0;
+    float    last_baro_temp = 0;
+    float    last_baro_msl = 0;
+
+    // True once the first DID_MAGNETOMETER has been reported to the GCS (diagnostic).
+    bool mag_reported = false;
+
+    // DID_SYS_PARAMS / PIMU-dt diagnostics are emitted *periodically* (a few
+    // times, ~5 s apart) rather than one-shot: dataflash logging can start ~10 s
+    // after boot, well after a one-shot boot message would have fired, so a
+    // single emission shows up live on the GCS but never lands in the .bin log.
+    static constexpr uint8_t DIAG_REPORT_MAX = 6;       // ~30 s of coverage
+    static constexpr uint32_t DIAG_REPORT_INTERVAL_MS = 5000;
+    uint8_t  sys_params_reports = 0;
+    uint32_t last_sys_params_report_ms = 0;
+    uint8_t  pimu_reports = 0;
+    uint32_t last_pimu_report_ms = 0;
+
+    // Flash-config startup periods captured from DID_FLASH_CONFIG, re-emitted in
+    // the periodic sys_params diagnostic so the flash-vs-runtime comparison
+    // (startupNavDtMs vs navOutputPeriodMs) lands in the .bin log, not just live.
+    uint32_t cfg_nav_dt_ms = 0;
+    uint32_t cfg_imu_dt_ms = 0;
+
+    // SPSC ring of pending GCS messages (producer: read thread, consumer: update()).
+    struct pending_text_t {
+        uint8_t severity;
+        char text[64];
+    };
+    static constexpr uint8_t PENDING_TEXT_QUEUE_SIZE = 8;
+    pending_text_t pending_text[PENDING_TEXT_QUEUE_SIZE];
+    uint8_t pending_text_head = 0;
+    uint8_t pending_text_tail = 0;
+
+    uint32_t last_gps_pkt = 0;
+    uint32_t last_filter_pkt = 0;    // INS_3 (on-device EKF solution); INS mode only
+    uint32_t last_imu_pkt = 0;       // PIMU; used for health in IMU mode
 
     char _name[40] = "Inertial Sense";
 

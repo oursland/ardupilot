@@ -73,7 +73,7 @@ const AP_Param::GroupInfo AP_ExternalAHRS::var_info[] = {
     // @Param: _OPTIONS
     // @DisplayName: External AHRS options
     // @Description: External AHRS options bitmask
-    // @Bitmask: 0:Vector Nav use uncompensated values for accel gyro and mag.
+    // @Bitmask: 0:Vector Nav use uncompensated values for accel gyro and mag., 1:InertialSense use device as a raw IMU (disables on-device EKF; removes INS solution messages)
     // @User: Standard
     AP_GROUPINFO("_OPTIONS", 3, AP_ExternalAHRS, options, 0),
 
