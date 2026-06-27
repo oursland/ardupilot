@@ -1,3 +1,59 @@
 # CAN
 CAN_P1_DRIVER 1  # Enables the use of CAN
 
+# =============================================================================
+# DEV-ONLY (strip before any upstream PR): InertialSense IMX (SPI) + EKF3-on-PIMU
+# bench/test configuration. This defaults.parm is auto-embedded into the
+# firmware, so these provide the power-on values when the flash storage sector
+# is blank (e.g. after an SWD/mass-erase flash) and the vehicle comes up
+# configured without re-entering everything each reflash. Params set over
+# MAVLink still override these and persist to storage until the next wipe.
+# =============================================================================
+
+# --- External AHRS: InertialSense IMX over SPI ---
+EAHRS_TYPE       12
+# GPS(1)+IMU(2)+BARO(4)+COMPASS(8) = 15. All four IMX sensors confirmed working on
+# FW 3.0.1 (the µT magnetometer bug was fixed in 3.0.1; baro now reads real kPa).
+# IMX baro/compass register as instance 0; onboard BMP388 + IIS2MDC are instance 1
+# (redundant).
+EAHRS_SENSORS    15
+# IMU mode (bit 1 set). The IMU feed is the IMX's antialiased PIMU (the actual
+# value over the onboard raw IMU). On FW 3.0.x the PIMU rate follows the nav-
+# UPDATE period: with the on-device EKF ON (INS mode); with
+# it OFF (IMU mode) navUpd drops to ~4 ms = ~250 Hz. So IMU mode is selected to
+# get high-rate PIMU. The driver writes sysCfgBits to disable the on-device EKF
+# -> power-cycle the IMX once to apply. ArduPilot's EKF3 is the AHRS (was already
+# primary in INS mode too; INS_3 was only a logged reference).
+# To REVERT to the INS-mode:
+# EAHRS_OPTIONS 0
+EAHRS_OPTIONS    2
+# IMU registration rate. Set to the measured PIMU rate (IMU0.GHz). Expect ~250 in
+# IMU mode; adjust if it diverges.
+EAHRS_RATE       250
+
+# External AHRS supplies the GPS
+GPS_TYPE         21
+GPS1_TYPE        21
+
+# --- EKF3 fuses the external PIMU as its IMU ---
+AHRS_EKF_TYPE    3
+EK3_ENABLE       1
+# External InertialSense IMU is instance 0 (added before the onboard IMU)
+EK3_IMU_MASK     1
+EK3_PRIMARY      0
+
+# Use external IMU (instance 0) only; ignore the onboard IMU (instance 1)
+INS_USE          1
+INS_USE2         0
+
+# Loop rate 250 Hz to match the PIMU published rate
+SCHED_LOOP_RATE  250
+
+# Frame: Quad/X. Baked so an SWD param wipe doesn't leave FRAME_CLASS unset
+# ("Frame: UNSUPPORTED" -> "PreArm: Motors: Check frame class and type").
+# Change to match the airframe if it isn't a quad-X.
+FRAME_CLASS      1
+FRAME_TYPE       1
+
+# Capture static/bench runs before arming
+LOG_DISARMED     1
